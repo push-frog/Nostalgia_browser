@@ -218,4 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 #Settings
-nostalgia_settings.json
+**/nostalgia_settings.json
