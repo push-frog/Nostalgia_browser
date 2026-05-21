@@ -970,6 +970,36 @@
       "url": "https://upload.wikimedia.org/wikipedia/en/0/0e/Internet_Explorer_5_on_Windows_98.png",
       "title": "https://upload.wikimedia.org/wikipedia/en/0/0e/Internet_Explorer_5_on_Windows_98.png",
       "time": "2026-05-21T01:18:30.145428"
+    },
+    {
+      "url": "https://www.google.com",
+      "title": "",
+      "time": "2026-05-22T00:10:54.778389"
+    },
+    {
+      "url": "https://www.google.com/",
+      "title": "https://www.google.com",
+      "time": "2026-05-22T00:10:56.971340"
+    },
+    {
+      "url": "https://192.168.1.115",
+      "title": "",
+      "time": "2026-05-22T00:11:04.607619"
+    },
+    {
+      "url": "https://www.google.com/",
+      "title": "",
+      "time": "2026-05-22T00:11:06.652356"
+    },
+    {
+      "url": "https://192.168.1.115/",
+      "title": "https://192.168.1.115",
+      "time": "2026-05-22T00:11:06.714792"
+    },
+    {
+      "url": "http://192.168.1.115/",
+      "title": "Web Viewer",
+      "time": "2026-05-22T00:11:12.714560"
     }
   ],
   "homepage": "https://www.google.com",
