@@ -296,7 +296,7 @@ class ThemeDialog(QDialog):
 
 
 class GifLoadingWidget(QWidget):
-    GIF_PATH = 'internet-explorer.gif'
+    GIF_PATH = 'planet.gif'
     SIZE     = QSize(26, 26)
 
     def __init__(self, parent=None):
