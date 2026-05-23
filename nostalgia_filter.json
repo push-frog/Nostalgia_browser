@@ -1,7 +1,5 @@
 {
-  "blacklist": [
-    "dzen.ru"
-  ],
+  "blacklist": [],
   "whitelist": [],
   "use_whitelist": false,
   "use_blacklist": true,
