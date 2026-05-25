@@ -3,12 +3,14 @@ import json
 import os
 import re
 import datetime
+import shutil
 from html import escape as html_escape
 from urllib.parse import urlparse, quote_plus
+from cryptography.fernet import Fernet
 
 from PyQt6.QtCore import (
     QUrl, Qt, QSize, QTimer, QPoint, QRectF,
-    pyqtSignal, QStandardPaths
+    pyqtSignal, QStandardPaths, QDateTime
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QToolBar,
@@ -23,19 +25,21 @@ from PyQt6.QtWidgets import (
     QCheckBox, QTableWidget,
     QTableWidgetItem, QHeaderView,
     QFileDialog, QScrollArea, QGroupBox,
-    QRadioButton, QButtonGroup, QTabBar
+    QRadioButton, QButtonGroup, QTabBar,
+    QTreeWidget, QTreeWidgetItem
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEnginePage,
     QWebEngineDownloadRequest,
-    QWebEngineScript, QWebEngineSettings
+    QWebEngineScript, QWebEngineSettings,
+    QWebEngineCertificateError
 )
 from PyQt6.QtGui import (
     QFont, QColor, QPalette, QPixmap,
     QFontDatabase, QPainter, QPen, QBrush,
     QKeySequence, QMovie, QPolygon, QAction,
-    QShortcut
+    QShortcut, QIcon
 )
 from PyQt6.QtNetwork import QNetworkCookie
 
@@ -72,6 +76,7 @@ def validate_domain(domain: str) -> bool:
     return bool(_DOMAIN_RE.match(domain))
 
 
+# Расширенные темы с новыми цветами для индикаторов
 THEMES = {
     "Классическая (Windows 98)": {
         "Window":          "#D4D0C8",
@@ -216,14 +221,24 @@ def apply_theme(app: QApplication, theme_name: str):
     app.setPalette(palette)
     app._current_theme = theme_name
     app._current_theme_data = theme
-    app.setStyleSheet("QWebEngineView { background: white; }")
+    app.setStyleSheet("""
+        QWebEngineView { background: white; }
+        QToolTip { 
+            background-color: #FFFFE1; 
+            color: #000000;
+            border: 1px solid black;
+            font-size: 8pt;
+        }
+        QTabBar::tab:hover {
+            background-color: #E3DFDB;
+        }
+    """)
 
 
 class ThemeDialog(QDialog):
     """Диалог выбора темы оформления с предпросмотром цветов."""
 
     def __init__(self, current_theme: str, parent=None):
-        """Создаёт диалог, выделяя текущую активную тему."""
         super().__init__(parent)
         self.setWindowTitle("Темы оформления - Nostalgia")
         self.setFixedSize(400, 360)
@@ -283,12 +298,10 @@ class ThemeDialog(QDialog):
         layout.addWidget(bb)
 
     def _on_select(self, btn: QRadioButton):
-        """Обновляет предпросмотр при выборе новой темы."""
         self.selected_theme = btn.text()
         self._update_preview(self.selected_theme)
 
     def _update_preview(self, theme_name: str):
-        """Рисует мини-превью цветов выбранной темы."""
         theme = THEMES.get(theme_name, {})
         win_c = theme.get("Window", "#D4D0C8")
         hi_c = theme.get("Highlight", "#000080")
@@ -304,21 +317,18 @@ class ThemeDialog(QDialog):
         )
 
     def _on_ok(self):
-        """Сохраняет выбранную тему и закрывает диалог."""
         checked = self.btn_group.checkedButton()
         if checked:
             self.selected_theme = checked.text()
         self.accept()
 
 
-class GifLoadingWidget(QWidget):
-    """Виджет с анимированным глобусом в адресной строке — крутится во время загрузки."""
+class EnhancedGifLoadingWidget(QWidget):
+    """Улучшенный виджет с анимированным глобусом и индикацией загрузки."""
 
-    GIF_PATH = 'planet.gif'
     SIZE = QSize(26, 26)
 
     def __init__(self, parent=None):
-        """Инициализирует виджет, загружает GIF или рисует заглушку."""
         super().__init__(parent)
         self.setFixedSize(self.SIZE)
         self.label = QLabel(self)
@@ -329,17 +339,26 @@ class GifLoadingWidget(QWidget):
         layout.addWidget(self.label)
         self.movie = None
         self._static_frame = None
-        if os.path.exists(self.GIF_PATH):
-            self._init_movie()
-        else:
-            self._set_fallback()
+        self._load_gif_or_fallback()
         self.show()
 
-    def _init_movie(self):
-        """Загружает GIF-файл и подготавливает первый кадр для статичного состояния."""
-        self.movie = QMovie(self.GIF_PATH)
+    def _load_gif_or_fallback(self):
+        """Загружает GIF или создает улучшенную анимированную иконку."""
+        gif_paths = ['planet.gif', 'loading.gif', 'ie_spinner.gif']
+        
+        for path in gif_paths:
+            if os.path.exists(path):
+                self._init_movie(path)
+                return
+        
+        # Если GIF не найден, создаем анимированный QMovie из фреймов
+        self._create_animated_fallback()
+
+    def _init_movie(self, gif_path):
+        """Загружает GIF-файл и подготавливает первый кадр."""
+        self.movie = QMovie(gif_path)
         if not self.movie.isValid():
-            self._set_fallback()
+            self._create_animated_fallback()
             return
         self.movie.setScaledSize(self.SIZE)
         self.movie.jumpToFrame(0)
@@ -355,29 +374,61 @@ class GifLoadingWidget(QWidget):
         self._show_static()
         self.movie.frameChanged.connect(self._on_frame)
 
-    def _set_fallback(self):
-        """Рисует иконку «IE» если GIF-файл не найден."""
-        px = QPixmap(self.SIZE)
-        px.fill(Qt.GlobalColor.transparent)
-        p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(0, 80, 180)))
-        p.setPen(QPen(QColor(0, 0, 120), 1))
-        p.drawRoundedRect(2, 2, self.SIZE.width()-4, self.SIZE.height()-4, 4, 4)
-        p.setPen(QColor(Qt.GlobalColor.white))
-        p.setFont(QFont("Tahoma", 6, QFont.Weight.Bold))
-        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "IE")
-        p.end()
-        self._static_frame = px
+    def _create_animated_fallback(self):
+        """Создает анимированный спиннер программно."""
+        from PyQt6.QtCore import QTimer
+        
+        self._frames = []
+        self._current_frame = 0
+        
+        # Создаем 12 кадров вращающегося круга
+        for i in range(12):
+            px = QPixmap(self.SIZE)
+            px.fill(Qt.GlobalColor.transparent)
+            p = QPainter(px)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # Рисуем внешний круг
+            p.setBrush(QBrush(QColor(0, 80, 180)))
+            p.setPen(QPen(QColor(0, 0, 120), 1))
+            p.drawRoundedRect(2, 2, self.SIZE.width()-4, self.SIZE.height()-4, 4, 4)
+            
+            # Рисуем вращающийся индикатор
+            p.save()
+            p.translate(13, 13)
+            p.rotate(i * 30)
+            p.setBrush(QBrush(QColor(0, 200, 0)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRect(8, -2, 4, 4)
+            p.restore()
+            
+            # Рисуем букву N в центре
+            p.setPen(QColor(Qt.GlobalColor.white))
+            p.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
+            p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "N")
+            p.end()
+            
+            self._frames.append(px)
+        
+        self._static_frame = self._frames[0]
         self._show_static()
+        
+        self._animation_timer = QTimer(self)
+        self._animation_timer.timeout.connect(self._animate_frame)
+        self._animation_timer.setInterval(100)
+
+    def _animate_frame(self):
+        """Обновляет кадр анимации."""
+        if hasattr(self, '_frames'):
+            self._current_frame = (self._current_frame + 1) % len(self._frames)
+            self.label.setPixmap(self._frames[self._current_frame])
 
     def _show_static(self):
-        """Показывает статичный (первый) кадр анимации."""
+        """Показывает статичный кадр."""
         if self._static_frame:
             self.label.setPixmap(self._static_frame)
 
     def _on_frame(self, _):
-        """Обновляет отображаемый кадр при смене кадра анимации."""
         if self.movie:
             img = self.movie.currentImage()
             if not img.isNull():
@@ -390,15 +441,19 @@ class GifLoadingWidget(QWidget):
                 ))
 
     def start(self):
-        """Запускает анимацию — вызывается при начале загрузки страницы."""
+        """Запускает анимацию."""
         if self.movie:
             self.movie.start()
+        elif hasattr(self, '_animation_timer'):
+            self._animation_timer.start()
 
     def stop(self):
-        """Останавливает анимацию и возвращает первый кадр."""
+        """Останавливает анимацию."""
         if self.movie:
             self.movie.stop()
             self.movie.jumpToFrame(0)
+        elif hasattr(self, '_animation_timer'):
+            self._animation_timer.stop()
         self._show_static()
 
 
@@ -406,7 +461,6 @@ class SiteFilter:
     """Фильтр сайтов по чёрному и белому спискам доменов."""
 
     def __init__(self):
-        """Загружает списки из файла при создании."""
         self.blacklist = []
         self.whitelist = []
         self.use_whitelist = False
@@ -416,7 +470,6 @@ class SiteFilter:
         self.load_lists()
 
     def load_lists(self):
-        """Читает настройки фильтрации из nostalgia_filter.json."""
         try:
             if os.path.exists('nostalgia_filter.json'):
                 with open('nostalgia_filter.json', 'r', encoding='utf-8') as f:
@@ -437,7 +490,6 @@ class SiteFilter:
             print(f"Ошибка загрузки фильтра: {e}")
 
     def save_lists(self):
-        """Сохраняет текущие списки и настройки фильтра в файл."""
         try:
             with open('nostalgia_filter.json', 'w', encoding='utf-8') as f:
                 json.dump({
@@ -452,7 +504,6 @@ class SiteFilter:
             print(f"Ошибка сохранения фильтра: {e}")
 
     def extract_domain(self, url):
-        """Извлекает доменное имя из URL-строки или объекта QUrl."""
         try:
             if isinstance(url, QUrl):
                 url = url.toString()
@@ -467,7 +518,6 @@ class SiteFilter:
             return ""
 
     def is_blocked(self, url) -> bool:
-        """Возвращает True если сайт нужно заблокировать согласно настройкам."""
         if not self.filter_enabled:
             return False
         domain = self.extract_domain(url)
@@ -486,10 +536,7 @@ class SiteFilter:
 
 
 class FilterDialog(QDialog):
-    """Диалог настройки фильтрации — управление чёрным и белым списками."""
-
     def __init__(self, site_filter, parent=None):
-        """Принимает объект SiteFilter и строит интерфейс редактирования списков."""
         super().__init__(parent)
         self.site_filter = site_filter
         self.setWindowTitle("Настройка фильтрации сайтов - Nostalgia")
@@ -500,7 +547,6 @@ class FilterDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
-        """Строит вкладки с таблицами доменов и чекбоксами настроек."""
         layout = QVBoxLayout(self)
         sg = QWidget()
         sl = QVBoxLayout(sg)
@@ -567,7 +613,6 @@ class FilterDialog(QDialog):
         self._refresh_tables()
 
     def _refresh_tables(self):
-        """Перезаполняет таблицы актуальными данными из объекта фильтра."""
         for tbl, lst in [(self.blacklist_table, self.site_filter.blacklist),
                          (self.whitelist_table, self.site_filter.whitelist)]:
             tbl.setRowCount(len(lst))
@@ -575,7 +620,6 @@ class FilterDialog(QDialog):
                 tbl.setItem(i, 0, QTableWidgetItem(d))
 
     def _add(self, list_type: str):
-        """Запрашивает домен у пользователя и добавляет его в нужный список."""
         label = "черный" if list_type == 'black' else "белый"
         domain, ok = QInputDialog.getText(
             self, f"Добавить в {label} список", "Введите домен:"
@@ -594,7 +638,6 @@ class FilterDialog(QDialog):
                 self._refresh_tables()
 
     def _remove(self, table: QTableWidget, list_type: str):
-        """Удаляет выделенный домен из таблицы и соответствующего списка."""
         row = table.currentRow()
         if row >= 0:
             item = table.item(row, 0)
@@ -606,7 +649,6 @@ class FilterDialog(QDialog):
                 self._refresh_tables()
 
     def accept(self):
-        """Сохраняет изменения в объект фильтра и на диск перед закрытием."""
         self.site_filter.filter_enabled = self.enable_filter.isChecked()
         self.site_filter.use_blacklist = self.use_blacklist.isChecked()
         self.site_filter.use_whitelist = self.use_whitelist.isChecked()
@@ -616,44 +658,33 @@ class FilterDialog(QDialog):
 
 
 class NostalgiaStyle:
-    """Утилита первичной стилизации — применяет классическую тему при запуске."""
-
     @staticmethod
     def apply_style(app):
-        """Устанавливает тему «Классическая (Windows 98)» по умолчанию."""
         apply_theme(app, "Классическая (Windows 98)")
 
 
 class NostalgiaSchemeHandler:
-    """Хранилище HTML-страниц для внутренней схемы nostalgia://."""
-
     def __init__(self):
-        """Инициализирует пустой кеш страниц и счётчик."""
         self._blocked_pages = {}
         self._counter = 0
 
     def register_page(self, html_content: str) -> str:
-        """Сохраняет HTML-страницу и возвращает её внутренний URL."""
         self._counter += 1
         pid = f"blocked_{self._counter}"
         self._blocked_pages[pid] = html_content
         return f"nostalgia:{pid}"
 
     def get_page(self, pid: str) -> str:
-        """Возвращает HTML по идентификатору страницы или сообщение об ошибке."""
         return self._blocked_pages.get(
             pid, "<html><body>Страница не найдена</body></html>"
         )
 
 
 class IncognitoProfile:
-    """Синглтон профиля инкогнито — не сохраняет историю, cookie и кэш."""
-
     _instance: QWebEngineProfile | None = None
 
     @classmethod
     def get(cls) -> QWebEngineProfile:
-        """Возвращает единственный экземпляр профиля инкогнито, создавая его при первом вызове."""
         if cls._instance is None:
             cls._instance = QWebEngineProfile()
             cls._instance.setHttpUserAgent(
@@ -668,10 +699,7 @@ class IncognitoProfile:
 
 
 class DownloadItem(QWidget):
-    """Строка одной загрузки: имя файла, прогресс-бар, статус и кнопка действия."""
-
     def __init__(self, download: QWebEngineDownloadRequest, parent=None):
-        """Подключается к сигналам объекта загрузки и строит UI строки."""
         super().__init__(parent)
         self.download = download
         self._finished = False
@@ -709,7 +737,6 @@ class DownloadItem(QWidget):
 
     @staticmethod
     def _fmt(b: int) -> str:
-        """Форматирует количество байт в человекочитаемую строку (Б/КБ/МБ/ГБ)."""
         if b < 1024:
             return f"{b} Б"
         elif b < 1024**2:
@@ -719,7 +746,6 @@ class DownloadItem(QWidget):
         return f"{b/1024**3:.2f} ГБ"
 
     def _on_progress_changed(self):
-        """Обновляет прогресс-бар и метку с объёмом полученных данных."""
         received = self.download.receivedBytes()
         total = self.download.totalBytes()
         if total > 0:
@@ -733,7 +759,6 @@ class DownloadItem(QWidget):
             self.info_label.setText(self._fmt(received))
 
     def _on_finished_changed(self):
-        """Обновляет UI после завершения загрузки — показывает статус и меняет кнопку."""
         if not self.download.isFinished():
             return
         self._finished = True
@@ -752,7 +777,6 @@ class DownloadItem(QWidget):
             self.action_btn.setText("Удалить")
 
     def _on_action(self):
-        """Отменяет загрузку если идёт, открывает папку или удаляет строку если завершена."""
         if not self._finished:
             self.download.cancel()
         else:
@@ -770,10 +794,7 @@ class DownloadItem(QWidget):
 
 
 class DownloadManagerDialog(QDialog):
-    """Менеджер загрузок — показывает все активные и завершённые загрузки."""
-
     def __init__(self, parent=None):
-        """Создаёт прокручиваемый список строк загрузок."""
         super().__init__(parent)
         self.setWindowTitle("Менеджер загрузок - Nostalgia")
         self.resize(620, 380)
@@ -821,7 +842,6 @@ class DownloadManagerDialog(QDialog):
         self._items: list[DownloadItem] = []
 
     def add_download(self, download: QWebEngineDownloadRequest):
-        """Добавляет новую загрузку в список и показывает окно менеджера."""
         w = DownloadItem(download, self.container)
         self.items_layout.insertWidget(self.items_layout.count() - 1, w)
         self._items.append(w)
@@ -830,7 +850,6 @@ class DownloadManagerDialog(QDialog):
         self.raise_()
 
     def remove_item(self, w: DownloadItem):
-        """Удаляет строку загрузки из списка и уничтожает виджет."""
         if w in self._items:
             self._items.remove(w)
             self.items_layout.removeWidget(w)
@@ -838,21 +857,16 @@ class DownloadManagerDialog(QDialog):
             self._update_count()
 
     def clear_finished(self):
-        """Удаляет все завершённые (успешно, отменённые, с ошибкой) строки."""
         for w in list(self._items):
             if w._finished:
                 self.remove_item(w)
 
     def _update_count(self):
-        """Обновляет счётчик загрузок в нижней части окна."""
         self.total_label.setText(f"Загрузок: {len(self._items)}")
 
 
 class FindBar(QWidget):
-    """Панель поиска по странице — появляется снизу вкладки по Ctrl+F."""
-
     def __init__(self, parent=None):
-        """Создаёт скрытую панель с полем ввода и кнопками навигации."""
         super().__init__(parent)
         self.setFixedHeight(28)
         self.setVisible(False)
@@ -893,37 +907,31 @@ class FindBar(QWidget):
         self._webview: QWebEngineView | None = None
 
     def set_webview(self, wv):
-        """Привязывает панель к конкретному QWebEngineView."""
         self._webview = wv
 
     def open_bar(self):
-        """Показывает панель и ставит фокус в поле ввода."""
         self.setVisible(True)
         self.search_edit.setFocus()
         self.search_edit.selectAll()
 
     def close_bar(self):
-        """Скрывает панель и снимает выделение найденного текста."""
         self.setVisible(False)
         if self._webview:
             self._webview.findText("")
             self._webview.setFocus()
 
     def _flags(self):
-        """Собирает флаги поиска с учётом чекбокса регистра."""
         f = QWebEnginePage.FindFlag(0)
         if self.case_check.isChecked():
             f |= QWebEnginePage.FindFlag.FindCaseSensitively
         return f
 
     def find_next(self):
-        """Ищет следующее вхождение текста на странице."""
         t = self.search_edit.text()
         if self._webview and t:
             self._webview.findText(t, self._flags(), self._on_result)
 
     def find_prev(self):
-        """Ищет предыдущее вхождение текста на странице."""
         t = self.search_edit.text()
         if self._webview and t:
             self._webview.findText(
@@ -933,7 +941,6 @@ class FindBar(QWidget):
             )
 
     def _on_text_changed(self, t: str):
-        """Запускает поиск при каждом изменении текста в поле ввода."""
         self.result_label.setText("")
         if self._webview:
             if t:
@@ -942,7 +949,6 @@ class FindBar(QWidget):
                 self._webview.findText("")
 
     def _on_result(self, result):
-        """Показывает «Найдено» или «Не найдено» по результату поиска."""
         t = self.search_edit.text()
         if not t:
             self.result_label.setText("")
@@ -971,10 +977,7 @@ SEARCH_ENGINES = {
 
 
 class SearchEngineDialog(QDialog):
-    """Диалог выбора поисковой системы по умолчанию."""
-
     def __init__(self, current_engine: str, parent=None):
-        """Создаёт список поисковиков с предпросмотром URL шаблона."""
         super().__init__(parent)
         self.setWindowTitle("Поисковые системы - Nostalgia")
         self.setFixedSize(420, 320)
@@ -1029,322 +1032,106 @@ class SearchEngineDialog(QDialog):
         layout.addWidget(bb)
 
     def _update_preview(self, name: str):
-        """Показывает пример URL выбранного поисковика."""
         url = SEARCH_ENGINES.get(name, "")
         self.preview.setText(f"URL: {url.replace('{query}', 'пример')}")
 
     def _on_ok(self):
-        """Сохраняет выбранный поисковик и закрывает диалог."""
         checked = self.btn_group.checkedButton()
         if checked:
             self.selected = checked.text()
         self.accept()
 
 
-class CookieManagerDialog(QDialog):
-    """Диалог просмотра и удаления cookie текущего профиля."""
-
-    def __init__(self, profile: QWebEngineProfile, parent=None):
-        """Принимает профиль браузера и загружает список cookie."""
-        super().__init__(parent)
-        self.profile = profile
-        self._cookies: list = []
-        self.setWindowTitle("Управление cookie - Nostalgia")
-        self.resize(700, 480)
-        self.setWindowFlags(
-            Qt.WindowType.Window |
-            Qt.WindowType.WindowTitleHint |
-            Qt.WindowType.WindowCloseButtonHint |
-            Qt.WindowType.WindowMinimizeButtonHint
-        )
-        if parent:
-            geo = parent.geometry()
-            self.move(geo.center().x()-350, geo.center().y()-240)
-
-        self._cookie_store_available = False
-        self._build_ui()
-        self._try_load_cookies()
-
-    def _build_ui(self):
-        """Создаёт таблицу с фильтром по домену и кнопками удаления."""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Фильтр по домену:"))
-        self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Введите домен для фильтрации...")
-        self.filter_edit.textChanged.connect(self._apply_filter)
-        top.addWidget(self.filter_edit)
-        layout.addLayout(top)
-
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(
-            ["Домен", "Имя", "Значение", "Истекает"]
-        )
-        hdr = self.table.horizontalHeader()
-        hdr.setStretchLastSection(True)
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        layout.addWidget(self.table)
-
-        self.api_warn = QLabel("")
-        self.api_warn.setStyleSheet("color: #804000; font-size: 8pt;")
-        self.api_warn.setWordWrap(True)
-        layout.addWidget(self.api_warn)
-
-        bottom = QHBoxLayout()
-        self.count_label = QLabel("Cookie: 0")
-        bottom.addWidget(self.count_label)
-        bottom.addStretch()
-
-        del_btn = QPushButton("Удалить выбранные")
-        del_btn.clicked.connect(self._delete_selected)
-        bottom.addWidget(del_btn)
-
-        del_all_btn = QPushButton("Удалить все")
-        del_all_btn.clicked.connect(self._delete_all)
-        bottom.addWidget(del_all_btn)
-
-        refresh_btn = QPushButton("Обновить")
-        refresh_btn.clicked.connect(self._try_load_cookies)
-        bottom.addWidget(refresh_btn)
-
-        close_btn = QPushButton("Закрыть")
-        close_btn.clicked.connect(self.close)
-        bottom.addWidget(close_btn)
-        layout.addLayout(bottom)
-
-    def _try_load_cookies(self):
-        """Пробует подключиться к cookieStore и начать загрузку cookie."""
-        self._cookies.clear()
-        self.table.setRowCount(0)
-
-        store = None
-        try:
-            store = self.profile.cookieStore()
-        except Exception:
-            store = None
-
-        if store is None:
-            self.api_warn.setText(
-                "⚠  API cookieStore недоступен. Удаление всех cookie всё равно работает."
-            )
-            self._cookie_store_available = False
-            return
-
-        self._cookie_store_available = True
-        self.api_warn.setText("")
-
-        try:
-            store.cookieAdded.disconnect(self._on_cookie_added)
-        except Exception:
-            pass
-        store.cookieAdded.connect(self._on_cookie_added)
-
-        try:
-            store.loadAllCookies()
-        except AttributeError:
-            pass
-
-        QTimer.singleShot(400, self._populate_table)
-
-    def _on_cookie_added(self, cookie):
-        """Добавляет cookie во внутренний список, избегая дубликатов."""
-        try:
-            dom = cookie.domain()
-            name = bytes(cookie.name()).decode('utf-8', errors='replace')
-        except Exception:
-            return
-
-        for c in self._cookies:
-            try:
-                if (
-                    c.domain() == dom and
-                    bytes(c.name()).decode('utf-8', errors='replace') == name and
-                    c.path() == cookie.path()
-                ):
-                    return
-            except Exception:
-                continue
-        self._cookies.append(cookie)
-
-    def _populate_table(self):
-        """Заполняет таблицу текущим содержимым внутреннего списка cookie."""
-        self._apply_filter(self.filter_edit.text())
-
-    def _apply_filter(self, text: str):
-        """Фильтрует таблицу по введённому домену."""
-        text = text.lower().strip()
-        filtered = [c for c in self._cookies if not text or text in c.domain().lower()]
-        self.table.setRowCount(0)
-        for c in filtered:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
-            try:
-                exp = (
-                    c.expirationDate().toString("dd.MM.yyyy hh:mm")
-                    if c.expirationDate().isValid()
-                    else "Сессия"
-                )
-            except Exception:
-                exp = "—"
-
-            try:
-                val = bytes(c.value()).decode('utf-8', errors='replace')
-            except Exception:
-                val = "—"
-
-            if len(val) > 60:
-                val = val[:57] + "…"
-
-            try:
-                name = bytes(c.name()).decode('utf-8', errors='replace')
-            except Exception:
-                name = "—"
-
-            for col, txt in enumerate([c.domain(), name, val, exp]):
-                item = QTableWidgetItem(txt)
-                item.setToolTip(txt)
-                self.table.setItem(row, col, item)
-
-            self.table.item(row, 0).setData(Qt.ItemDataRole.UserRole, c)
-
-        self.count_label.setText(f"Cookie: {self.table.rowCount()}")
-
-    def _delete_selected(self):
-        """Удаляет выделенные строки через cookieStore, если API доступен."""
-        if not self._cookie_store_available:
-            QMessageBox.information(
-                self, "Информация",
-                "Удаление отдельных cookie недоступно.\nИспользуйте «Удалить все»."
-            )
-            return
-
-        rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()), reverse=True)
-        store = self.profile.cookieStore()
-        for row in rows:
-            item = self.table.item(row, 0)
-            if item:
-                cookie = item.data(Qt.ItemDataRole.UserRole)
-                if cookie:
-                    try:
-                        store.deleteCookie(cookie)
-                    except Exception:
-                        pass
-                    if cookie in self._cookies:
-                        self._cookies.remove(cookie)
-            self.table.removeRow(row)
-
-        self.count_label.setText(f"Cookie: {self.table.rowCount()}")
-
-    def _delete_all(self):
-        """Удаляет все cookie профиля после подтверждения пользователем."""
-        reply = QMessageBox.question(
-            self, "Удалить все cookie",
-            "Удалить все cookie для текущего профиля?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                self.profile.cookieStore().deleteAllCookies()
-            except Exception as e:
-                QMessageBox.warning(self, "Ошибка", f"Не удалось удалить cookie: {e}")
-                return
-            self._cookies.clear()
-            self.table.setRowCount(0)
-            self.count_label.setText("Cookie: 0")
+# Безопасное шифрование паролей с Fernet
+PASSWORDS_FILE = 'nostalgia_passwords.dat'
+KEY_FILE = 'nostalgia_key.key'
 
 
-PASSWORDS_FILE = 'nostalgia_passwords.json'
-_XOR_KEY = 0x5A
-
-
-def _obfuscate(s: str) -> str:
-    """Обфусцирует строку побайтовым XOR — не шифрование, только маскировка."""
-    return ''.join(f'{ord(c) ^ _XOR_KEY:02x}' for c in s)
-
-
-def _deobfuscate(s: str) -> str:
-    """Восстанавливает строку из обфусцированного hex-представления."""
-    try:
-        return ''.join(
-            chr(int(s[i:i+2], 16) ^ _XOR_KEY) for i in range(0, len(s), 2)
-        )
-    except Exception:
-        return ''
-
-
-class PasswordManager:
-    """Хранилище логинов и паролей с базовой обфускацией на диске."""
-
+class SecurePasswordManager:
+    """Безопасное хранилище паролей с шифрованием Fernet."""
+    
     def __init__(self):
-        """Загружает сохранённые записи из файла при создании."""
         self._entries: list[dict] = []
+        self._cipher = self._get_or_create_cipher()
         self._load()
-
+    
+    def _get_or_create_cipher(self):
+        """Получает или создает ключ шифрования."""
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, 'rb') as f:
+                key = f.read()
+        else:
+            # Генерируем новый ключ
+            key = Fernet.generate_key()
+            with open(KEY_FILE, 'wb') as f:
+                f.write(key)
+        return Fernet(key)
+    
+    def _encrypt(self, data: str) -> str:
+        """Шифрует строку."""
+        return self._cipher.encrypt(data.encode()).decode()
+    
+    def _decrypt(self, encrypted: str) -> str:
+        """Расшифровывает строку."""
+        try:
+            return self._cipher.decrypt(encrypted.encode()).decode()
+        except Exception:
+            return ""
+    
     def _load(self):
-        """Читает и валидирует записи из nostalgia_passwords.json."""
+        """Загружает зашифрованные пароли."""
         try:
             if os.path.exists(PASSWORDS_FILE):
-                with open(PASSWORDS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self._entries = [
-                    e for e in data
-                    if isinstance(e, dict)
-                    and isinstance(e.get('url'), str)
-                    and isinstance(e.get('login'), str)
-                    and isinstance(e.get('password'), str)
-                ]
+                with open(PASSWORDS_FILE, 'rb') as f:
+                    data = f.read()
+                decrypted = self._cipher.decrypt(data).decode()
+                self._entries = json.loads(decrypted)
         except Exception as e:
             print(f"Ошибка загрузки паролей: {e}")
             self._entries = []
-
+    
     def _save(self):
-        """Сохраняет все записи на диск в обфусцированном виде."""
+        """Сохраняет зашифрованные пароли."""
         try:
-            with open(PASSWORDS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self._entries, f, ensure_ascii=False, indent=2)
+            data = json.dumps(self._entries, ensure_ascii=False, indent=2)
+            encrypted = self._cipher.encrypt(data.encode())
+            with open(PASSWORDS_FILE, 'wb') as f:
+                f.write(encrypted)
         except Exception as e:
             print(f"Ошибка сохранения паролей: {e}")
-
+    
     def add(self, url: str, login: str, password: str):
-        """Добавляет запись или обновляет пароль если логин уже есть для этого сайта."""
+        """Добавляет или обновляет запись."""
         for e in self._entries:
             if e['url'] == url and e['login'] == login:
-                e['password'] = _obfuscate(password)
+                e['password'] = self._encrypt(password)
                 self._save()
                 return
         self._entries.append({
             'url': url,
             'login': login,
-            'password': _obfuscate(password),
+            'password': self._encrypt(password),
         })
         self._save()
-
+    
     def remove(self, index: int):
         """Удаляет запись по индексу."""
         if 0 <= index < len(self._entries):
             del self._entries[index]
             self._save()
-
+    
     def entries(self) -> list[dict]:
         """Возвращает копию списка всех записей."""
         return list(self._entries)
-
+    
     def get_password(self, index: int) -> str:
-        """Возвращает расшифрованный пароль записи по индексу."""
+        """Возвращает расшифрованный пароль."""
         if 0 <= index < len(self._entries):
-            return _deobfuscate(self._entries[index]['password'])
+            return self._decrypt(self._entries[index]['password'])
         return ''
-
+    
     def find_for_url(self, url: str) -> list[dict]:
-        """Ищет все записи с совпадающим доменом."""
+        """Ищет записи для домена."""
         try:
             domain = urlparse(url).netloc.lower()
         except Exception:
@@ -1358,13 +1145,15 @@ class PasswordManager:
             if edomain == domain:
                 result.append({'index': i, **e})
         return result
+    
+    def clear_all(self):
+        """Удаляет все пароли."""
+        self._entries = []
+        self._save()
 
 
 class PasswordManagerDialog(QDialog):
-    """Диалог управления сохранёнными паролями — просмотр, добавление, удаление."""
-
-    def __init__(self, password_manager: PasswordManager, parent=None):
-        """Принимает менеджер паролей и строит таблицу с кнопкой показа пароля."""
+    def __init__(self, password_manager: SecurePasswordManager, parent=None):
         super().__init__(parent)
         self.pm = password_manager
         self.setWindowTitle("Управление паролями - Nostalgia")
@@ -1380,21 +1169,20 @@ class PasswordManagerDialog(QDialog):
             self.move(geo.center().x()-340, geo.center().y()-220)
         self._build_ui()
         self._refresh()
-
+    
     def _build_ui(self):
-        """Строит таблицу записей с предупреждением о хранении паролей."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-
+        
         warn = QLabel(
-            "⚠  Пароли хранятся локально с базовой обфускацией. "
-            "Не используйте для критически важных аккаунтов."
+            "🔒 Пароли хранятся в зашифрованном виде (AES-128). "
+            "Ключ шифрования сохраняется локально."
         )
-        warn.setStyleSheet("color: #804000; font-size: 8pt;")
+        warn.setStyleSheet("color: #008000; font-size: 8pt; font-weight: bold;")
         warn.setWordWrap(True)
         layout.addWidget(warn)
-
+        
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Сайт", "Логин", "Пароль", ""])
@@ -1407,31 +1195,30 @@ class PasswordManagerDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
-
+        
         bottom = QHBoxLayout()
         self.count_lbl = QLabel("Записей: 0")
         bottom.addWidget(self.count_lbl)
         bottom.addStretch()
-
+        
         add_btn = QPushButton("Добавить")
         add_btn.clicked.connect(self._add_entry)
         bottom.addWidget(add_btn)
-
+        
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self._delete_selected)
         bottom.addWidget(del_btn)
-
+        
         del_all_btn = QPushButton("Удалить все")
         del_all_btn.clicked.connect(self._delete_all)
         bottom.addWidget(del_all_btn)
-
+        
         close_btn = QPushButton("Закрыть")
         close_btn.clicked.connect(self.close)
         bottom.addWidget(close_btn)
         layout.addLayout(bottom)
-
+    
     def _refresh(self):
-        """Перезаполняет таблицу актуальными данными из менеджера паролей."""
         self.table.setRowCount(0)
         for i, e in enumerate(self.pm.entries()):
             row = self.table.rowCount()
@@ -1447,9 +1234,8 @@ class PasswordManagerDialog(QDialog):
             show_btn.clicked.connect((lambda idx: lambda: self._toggle_password(idx))(i))
             self.table.setCellWidget(row, 3, show_btn)
         self.count_lbl.setText(f"Записей: {self.table.rowCount()}")
-
+    
     def _toggle_password(self, entry_index: int):
-        """Переключает отображение пароля между точками и открытым текстом."""
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 2)
             if item and item.data(Qt.ItemDataRole.UserRole) == entry_index:
@@ -1458,18 +1244,16 @@ class PasswordManagerDialog(QDialog):
                 else:
                     item.setText("••••••••")
                 break
-
+    
     def _add_entry(self):
-        """Открывает диалог добавления новой записи и сохраняет результат."""
         dlg = _AddPasswordDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             url, login, pwd = dlg.result_data
             if url and login and pwd:
                 self.pm.add(url, login, pwd)
                 self._refresh()
-
+    
     def _delete_selected(self):
-        """Удаляет выделенные строки из менеджера и таблицы."""
         rows = sorted(
             set(idx.row() for idx in self.table.selectedIndexes()),
             reverse=True
@@ -1479,25 +1263,20 @@ class PasswordManagerDialog(QDialog):
             if item:
                 self.pm.remove(item.data(Qt.ItemDataRole.UserRole))
         self._refresh()
-
+    
     def _delete_all(self):
-        """Удаляет все сохранённые пароли после подтверждения."""
         reply = QMessageBox.question(
             self, "Удалить все пароли",
-            "Удалить все сохранённые пароли?",
+            "Удалить все сохранённые пароли? Это действие необратимо.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            while self.pm.entries():
-                self.pm.remove(0)
+            self.pm.clear_all()
             self._refresh()
 
 
 class _AddPasswordDialog(QDialog):
-    """Маленький диалог для ввода нового логина и пароля вручную."""
-
     def __init__(self, parent=None):
-        """Создаёт форму с полями сайта, логина и пароля."""
         super().__init__(parent)
         self.setWindowTitle("Добавить пароль")
         self.setFixedSize(360, 210)
@@ -1510,7 +1289,7 @@ class _AddPasswordDialog(QDialog):
             geo = parent.geometry()
             self.move(geo.center().x()-180, geo.center().y()-105)
         self.result_data = ("", "", "")
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
         form = QFormLayout()
@@ -1523,7 +1302,7 @@ class _AddPasswordDialog(QDialog):
         form.addRow("Логин:", self.login_edit)
         form.addRow("Пароль:", self.pwd_edit)
         layout.addLayout(form)
-
+        
         show_cb = QCheckBox("Показать пароль")
         show_cb.toggled.connect(
             lambda c: self.pwd_edit.setEchoMode(
@@ -1531,12 +1310,12 @@ class _AddPasswordDialog(QDialog):
             )
         )
         layout.addWidget(show_cb)
-
+        
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
-
+        
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel
@@ -1544,9 +1323,8 @@ class _AddPasswordDialog(QDialog):
         bb.accepted.connect(self._on_ok)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
-
+    
     def _on_ok(self):
-        """Валидирует поля и сохраняет данные в result_data."""
         url = self.url_edit.text().strip()
         login = self.login_edit.text().strip()
         pwd = self.pwd_edit.text()
@@ -1560,10 +1338,7 @@ class _AddPasswordDialog(QDialog):
 
 
 class SavePasswordDialog(QDialog):
-    """Всплывающий запрос «Сохранить пароль?» после отправки формы."""
-
     def __init__(self, url: str, login: str, password: str, parent=None):
-        """Показывает домен и логин, предлагая сохранить или отклонить."""
         super().__init__(parent)
         self.url = url
         self.login = login
@@ -1578,11 +1353,11 @@ class SavePasswordDialog(QDialog):
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-200, geo.center().y()-90)
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
         layout.setSpacing(10)
-
+        
         top = QHBoxLayout()
         top.setSpacing(14)
         icon = QLabel()
@@ -1600,7 +1375,7 @@ class SavePasswordDialog(QDialog):
         p.end()
         icon.setPixmap(px)
         top.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
-
+        
         safe_login = html_escape(login)
         safe_url = html_escape(urlparse(url).netloc)
         msg = QLabel(
@@ -1611,12 +1386,12 @@ class SavePasswordDialog(QDialog):
         msg.setTextFormat(Qt.TextFormat.RichText)
         top.addWidget(msg, 1)
         layout.addLayout(top)
-
+        
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
-
+        
         bl = QHBoxLayout()
         bl.addStretch()
         yes_btn = QPushButton("Сохранить")
@@ -1633,10 +1408,7 @@ class SavePasswordDialog(QDialog):
 
 
 class ClearDataDialog(QDialog):
-    """Диалог выборочной очистки данных браузера с предупреждением о необратимости."""
-
     def __init__(self, parent=None):
-        """Создаёт чекбоксы для каждого типа данных: история, cookie, кэш и т.д."""
         super().__init__(parent)
         self.setWindowTitle("Очистка данных браузера - Nostalgia")
         self.setFixedSize(380, 320)
@@ -1648,15 +1420,15 @@ class ClearDataDialog(QDialog):
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-190, geo.center().y()-160)
-
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
         layout.setSpacing(10)
-
+        
         lbl = QLabel("Выберите данные для удаления:")
         lbl.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
         layout.addWidget(lbl)
-
+        
         box = QGroupBox()
         bl = QVBoxLayout(box)
         self.cb_history = QCheckBox("История просмотров")
@@ -1671,16 +1443,16 @@ class ClearDataDialog(QDialog):
                    self.cb_passwords, self.cb_bookmarks]:
             bl.addWidget(cb)
         layout.addWidget(box)
-
+        
         warn = QLabel("⚠  Действие необратимо!")
         warn.setStyleSheet("color: red; font-weight: bold;")
         layout.addWidget(warn)
-
+        
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
-
+        
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel
@@ -1689,26 +1461,248 @@ class ClearDataDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
-
+    
     @property
     def clear_history(self): return self.cb_history.isChecked()
-
     @property
     def clear_cookies(self): return self.cb_cookies.isChecked()
-
     @property
     def clear_cache(self): return self.cb_cache.isChecked()
-
     @property
     def clear_passwords(self): return self.cb_passwords.isChecked()
-
     @property
     def clear_bookmarks(self): return self.cb_bookmarks.isChecked()
 
 
-class NostalgiaPage(QWebEnginePage):
-    """Кастомная страница с фильтрацией URL, перехватом форм и блокировкой схем."""
+class BookmarkManagerDialog(QDialog):
+    """Диалог управления закладками с импортом/экспортом."""
+    
+    def __init__(self, bookmarks: dict, parent=None):
+        super().__init__(parent)
+        self.bookmarks = bookmarks
+        self.setWindowTitle("Управление закладками - Nostalgia")
+        self.resize(600, 450)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowCloseButtonHint |
+            Qt.WindowType.WindowMinimizeButtonHint
+        )
+        if parent:
+            geo = parent.geometry()
+            self.move(geo.center().x()-300, geo.center().y()-225)
+        
+        self._build_ui()
+        self._refresh()
+    
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Название", "URL"])
+        self.tree.setColumnWidth(0, 250)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.itemDoubleClicked.connect(self._open_bookmark)
+        layout.addWidget(self.tree)
+        
+        btn_layout = QHBoxLayout()
+        
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self._add_bookmark)
+        btn_layout.addWidget(add_btn)
+        
+        edit_btn = QPushButton("Изменить")
+        edit_btn.clicked.connect(self._edit_bookmark)
+        btn_layout.addWidget(edit_btn)
+        
+        del_btn = QPushButton("Удалить")
+        del_btn.clicked.connect(self._delete_bookmark)
+        btn_layout.addWidget(del_btn)
+        
+        btn_layout.addStretch()
+        
+        import_btn = QPushButton("Импорт из HTML")
+        import_btn.clicked.connect(self._import_bookmarks)
+        btn_layout.addWidget(import_btn)
+        
+        export_btn = QPushButton("Экспорт в HTML")
+        export_btn.clicked.connect(self._export_bookmarks)
+        btn_layout.addWidget(export_btn)
+        
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+    
+    def _refresh(self):
+        self.tree.clear()
+        for name, url in self.bookmarks.items():
+            item = QTreeWidgetItem([name, url])
+            self.tree.addTopLevelItem(item)
+    
+    def _open_bookmark(self, item: QTreeWidgetItem, column):
+        url = item.text(1)
+        if url and is_safe_url(QUrl(url)):
+            parent = self.parent()
+            if parent and hasattr(parent, 'add_new_tab'):
+                parent.add_new_tab(QUrl(url))
+    
+    def _add_bookmark(self):
+        name, ok1 = QInputDialog.getText(self, "Добавить закладку", "Название:")
+        if not ok1 or not name:
+            return
+        url, ok2 = QInputDialog.getText(self, "Добавить закладку", "URL:")
+        if not ok2 or not url:
+            return
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if is_safe_url(QUrl(url)):
+            self.bookmarks[name] = url
+            self._refresh()
+    
+    def _edit_bookmark(self):
+        item = self.tree.currentItem()
+        if not item:
+            return
+        old_name = item.text(0)
+        old_url = item.text(1)
+        
+        name, ok1 = QInputDialog.getText(self, "Редактировать", "Название:", text=old_name)
+        if not ok1 or not name:
+            return
+        url, ok2 = QInputDialog.getText(self, "Редактировать", "URL:", text=old_url)
+        if not ok2 or not url:
+            return
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if is_safe_url(QUrl(url)):
+            del self.bookmarks[old_name]
+            self.bookmarks[name] = url
+            self._refresh()
+    
+    def _delete_bookmark(self):
+        item = self.tree.currentItem()
+        if item:
+            name = item.text(0)
+            del self.bookmarks[name]
+            self._refresh()
+    
+    def _import_bookmarks(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Импорт закладок", "", "HTML Files (*.html *.htm)"
+        )
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Простой парсер HTML закладок
+                import re
+                pattern = r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>'
+                matches = re.findall(pattern, content)
+                
+                for url, name in matches:
+                    if is_safe_url(QUrl(url)):
+                        self.bookmarks[name] = url
+                
+                self._refresh()
+                QMessageBox.information(self, "Импорт", f"Импортировано {len(matches)} закладок.")
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось импортировать: {e}")
+    
+    def _export_bookmarks(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт закладок", "bookmarks.html", "HTML Files (*.html)"
+        )
+        if file_path:
+            try:
+                html = ['<!DOCTYPE html><html><head><title>Закладки Nostalgia</title></head>',
+                       '<body><h1>Закладки Nostalgia Browser</h1><ul>']
+                for name, url in self.bookmarks.items():
+                    html.append(f'<li><a href="{url}">{html_escape(name)}</a></li>')
+                html.append('</ul></body></html>')
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(html))
+                
+                QMessageBox.information(self, "Экспорт", f"Закладки экспортированы в {file_path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось экспортировать: {e}")
 
+
+class CertificateErrorDialog(QDialog):
+    """Диалог для ошибок SSL сертификата."""
+    
+    def __init__(self, error: QWebEngineCertificateError, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ошибка сертификата - Nostalgia")
+        self.setFixedSize(500, 300)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 12)
+        
+        # Иконка предупреждения
+        icon_label = QLabel()
+        icon_label.setFixedSize(48, 48)
+        px = QPixmap(48, 48)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(255, 200, 0)))
+        p.setPen(QPen(QColor(160, 100, 0), 2))
+        p.drawPolygon(QPolygon([QPoint(24, 2), QPoint(46, 45), QPoint(2, 45)]))
+        p.setPen(QPen(QColor(80, 40, 0), 3))
+        p.drawLine(24, 16, 24, 32)
+        p.drawLine(24, 37, 24, 40)
+        p.end()
+        icon_label.setPixmap(px)
+        
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(icon_label)
+        
+        error_text = QLabel(
+            f"<b>Ошибка сертификата безопасности</b><br><br>"
+            f"URL: {error.url().toString()}<br><br>"
+            f"Соединение не защищено. Продолжить?"
+        )
+        error_text.setWordWrap(True)
+        top_layout.addWidget(error_text, 1)
+        layout.addLayout(top_layout)
+        
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        proceed_btn = QPushButton("Продолжить (небезопасно)")
+        proceed_btn.clicked.connect(self.accept)
+        proceed_btn.setStyleSheet("color: red;")
+        btn_layout.addWidget(proceed_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        self.error = error
+    
+    def accept(self):
+        self.error.ignoreCertificateError()
+        super().accept()
+
+
+class NostalgiaPage(QWebEnginePage):
     open_in_new_tab = pyqtSignal(QUrl)
     page_blocked = pyqtSignal(str)
     scheme_blocked = pyqtSignal(str)
@@ -1717,7 +1711,6 @@ class NostalgiaPage(QWebEnginePage):
     def __init__(self, site_filter, scheme_handler,
                  block_popups: bool = True,
                  profile=None, parent=None):
-        """Инициализирует страницу с нужным профилем и вставляет JS-перехватчик форм."""
         if profile:
             super().__init__(profile, parent)
         else:
@@ -1728,9 +1721,18 @@ class NostalgiaPage(QWebEnginePage):
         self._blocked = False
         self._incognito = (profile is not None and profile == IncognitoProfile.get())
         self._install_form_interceptor()
+        
+        # Подключаем обработку ошибок сертификатов
+        self.certificateError.connect(self._on_certificate_error)
+
+    def _on_certificate_error(self, error: QWebEngineCertificateError):
+        """Обработка ошибок SSL сертификатов."""
+        dialog = CertificateErrorDialog(error, self.view())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            return True
+        return False
 
     def _install_form_interceptor(self):
-        """Внедряет JS, который перехватывает сабмит форм с паролем."""
         js = """
         (function() {
             if (window.__nostalgiaFormHooked) return;
@@ -1763,7 +1765,6 @@ class NostalgiaPage(QWebEnginePage):
         self.scripts().insert(script)
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-        """Разрешает или блокирует переход — проверяет схему и фильтр сайтов."""
         if url.scheme().lower() == "nostalgia":
             return True
         if is_main_frame:
@@ -1783,7 +1784,6 @@ class NostalgiaPage(QWebEnginePage):
         return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
     def _check_credentials(self, url: QUrl):
-        """Читает перехваченные JS-ом данные формы и инициирует предложение сохранить."""
         if self._incognito:
             return
         self.runJavaScript(
@@ -1792,7 +1792,6 @@ class NostalgiaPage(QWebEnginePage):
         )
 
     def _emit_credentials(self, url: str, creds):
-        """Испускает сигнал с логином и паролем если данные непусты."""
         if isinstance(creds, dict):
             login = creds.get('login', '')
             pwd = creds.get('password', '')
@@ -1801,7 +1800,6 @@ class NostalgiaPage(QWebEnginePage):
             self.runJavaScript("window.__nostalgiaCredentials = null;")
 
     def createWindow(self, win_type):
-        """Создаёт вспомогательную страницу для ссылок target=_blank, подавляя попапы."""
         if self.block_popups:
             if win_type in (
                 QWebEnginePage.WebWindowType.WebDialog,
@@ -1826,13 +1824,10 @@ class NostalgiaPage(QWebEnginePage):
 
 
 class BrowserTab(QWidget):
-    """Вкладка браузера: WebView + панель поиска + баннер инкогнито."""
-
     def __init__(self, site_filter, scheme_handler,
                  block_popups: bool = True,
                  incognito: bool = False,
                  parent=None):
-        """Создаёт вкладку с нужным профилем и подключает кастомную страницу."""
         super().__init__(parent)
         self.is_incognito = incognito
 
@@ -1873,11 +1868,9 @@ class BrowserTab(QWidget):
 
     @property
     def nostalgia_page(self) -> NostalgiaPage:
-        """Возвращает кастомный объект NostalgiaPage текущей вкладки."""
         return self.webview.page()
 
     def _show_context_menu(self, pos):
-        """Показывает контекстное меню с навигацией, копированием и масштабом."""
         menu = QMenu(self)
         page = self.webview.page()
 
@@ -1947,11 +1940,9 @@ class BrowserTab(QWidget):
         menu.exec(self.webview.mapToGlobal(pos))
 
     def _view_source(self):
-        """Запрашивает HTML страницы и открывает его в текстовом диалоге."""
         self.webview.page().toHtml(self._show_source_dialog)
 
     def _show_source_dialog(self, html: str):
-        """Отображает исходный HTML страницы в read-only редакторе."""
         dlg = QDialog(self)
         dlg.setWindowTitle("Исходный код страницы - Nostalgia")
         dlg.resize(800, 600)
@@ -1968,10 +1959,7 @@ class BrowserTab(QWidget):
 
 
 class BlockedDialog(QDialog):
-    """Уведомление о блокировке сайта фильтром."""
-
     def __init__(self, domain: str, parent=None):
-        """Показывает имя заблокированного домена с иконкой-крестом."""
         super().__init__(parent)
         self.setWindowTitle("Nostalgia Browser")
         self.setFixedSize(380, 220)
@@ -2034,10 +2022,7 @@ class BlockedDialog(QDialog):
 
 
 class SchemeBlockedDialog(QDialog):
-    """Уведомление о попытке перехода по неразрешённой схеме URL."""
-
     def __init__(self, scheme: str, parent=None):
-        """Показывает заблокированную схему и напоминает о разрешённых."""
         super().__init__(parent)
         self.setWindowTitle("Nostalgia Browser")
         self.setFixedSize(380, 200)
@@ -2100,10 +2085,7 @@ class SchemeBlockedDialog(QDialog):
 
 
 class HomepageDialog(QDialog):
-    """Диалог изменения домашней страницы браузера."""
-
     def __init__(self, current_homepage: str, parent=None):
-        """Создаёт поле ввода URL с валидацией при нажатии OK."""
         super().__init__(parent)
         self.setWindowTitle("Настройка домашней страницы - Nostalgia")
         self.setFixedSize(460, 160)
@@ -2146,7 +2128,6 @@ class HomepageDialog(QDialog):
         layout.addWidget(bb)
 
     def _validate_and_accept(self):
-        """Проверяет что введённый URL безопасен, потом закрывает диалог."""
         raw = self.url_edit.text().strip()
         if not raw:
             QMessageBox.warning(
@@ -2167,67 +2148,78 @@ class HomepageDialog(QDialog):
 
     @property
     def homepage(self) -> str:
-        """Возвращает валидированный URL домашней страницы."""
         return getattr(self, 'result_url', self.url_edit.text().strip())
 
 
-class TabLoadingWidget(QWidget):
-    """Маленький спиннер на вкладке, который крутится пока страница загружается."""
-
+class ColoredTabLoadingWidget(QWidget):
+    """Улучшенный спиннер с цветовой индикацией загрузки."""
+    
     def __init__(self, parent=None):
-        """Создаёт таймер анимации и скрывает виджет по умолчанию."""
         super().__init__(parent)
         self.setFixedSize(16, 16)
         self.angle = 0
         self.active = False
+        self.loading_stage = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.rotate)
         self.timer.setInterval(80)
 
     def start(self):
-        """Запускает вращение и показывает виджет."""
         self.active = True
         self.timer.start()
         self.show()
 
     def stop(self):
-        """Останавливает вращение и скрывает виджет."""
         self.active = False
         self.timer.stop()
         self.hide()
+    
+    def set_stage(self, stage: int):
+        self.loading_stage = stage
+        self.update()
 
     def rotate(self):
-        """Сдвигает угол на 15° и перерисовывает виджет."""
         if self.active:
             self.angle = (self.angle + 15) % 360
             self.update()
-
+    
     def paintEvent(self, event):
-        """Рисует синий круг с зелёными блоками — имитация классического IE-спиннера."""
         if not self.active:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QPen(QColor(0, 0, 200), 1))
-        p.setBrush(QBrush(QColor(0, 80, 200)))
+        
+        # Выбор цвета в зависимости от стадии загрузки
+        if self.loading_stage == 0:  # Подключение
+            color = QColor(255, 165, 0)  # Оранжевый
+        elif self.loading_stage == 1:  # Загрузка данных
+            color = QColor(0, 80, 200)  # Синий
+        else:  # Отрисовка
+            color = QColor(0, 200, 0)  # Зеленый
+        
+        p.setPen(QPen(color, 1))
+        p.setBrush(QBrush(color))
         p.drawEllipse(1, 1, 14, 14)
+        
         p.save()
         p.translate(8, 8)
         p.rotate(self.angle)
-        p.setPen(QPen(QColor(0, 200, 0), 0.8))
-        p.setBrush(QBrush(QColor(0, 170, 0)))
+        p.setPen(QPen(QColor(255, 255, 255), 0.8))
+        p.setBrush(QBrush(QColor(255, 255, 255)))
         for rect in [(-4, -2, 3, 2), (1, -2, 3, 2), (-3, 1, 2, 2), (1, 1, 2, 2)]:
             p.drawRect(*rect)
         p.restore()
-        p.setPen(QPen(QColor(255, 255, 255, 60), 0.5))
+        
+        p.setPen(QPen(color.lighter(150), 0.5))
         p.drawEllipse(0, 0, 16, 16)
 
 
-class NostalgiaBrowser(QMainWindow):
-    """Главное окно браузера — управляет вкладками, настройками и всем UI."""
+# Используем улучшенный спиннер
+TabLoadingWidget = ColoredTabLoadingWidget
 
+
+class NostalgiaBrowser(QMainWindow):
     def __init__(self):
-        """Инициализирует компоненты, загружает настройки и открывает первую вкладку."""
         super().__init__()
         self.setWindowTitle("Nostalgia Browser")
         self.setGeometry(100, 100, 1024, 768)
@@ -2241,7 +2233,7 @@ class NostalgiaBrowser(QMainWindow):
         self.current_theme = "Классическая (Windows 98)"
         self.current_engine = "Google"
         self.loading_tabs: dict[BrowserTab, TabLoadingWidget] = {}
-        self.password_manager = PasswordManager()
+        self.password_manager = SecurePasswordManager()
         self._download_manager: DownloadManagerDialog | None = None
 
         self.setup_profile()
@@ -2259,7 +2251,6 @@ class NostalgiaBrowser(QMainWindow):
         self.status_label.setText("Готово")
 
     def open_folder(self, path: str):
-        """Открывает папку в файловом менеджере ОС."""
         import subprocess
         import platform
         try:
@@ -2273,7 +2264,6 @@ class NostalgiaBrowser(QMainWindow):
             print(f"Не удалось открыть папку: {e}")
 
     def setup_profile(self):
-        """Настраивает User-Agent, язык и обработчик загрузок для дефолтного профиля."""
         profile = QWebEngineProfile.defaultProfile()
         profile.setHttpUserAgent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2294,7 +2284,6 @@ class NostalgiaBrowser(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
 
     def _on_download_requested(self, download: QWebEngineDownloadRequest):
-        """Спрашивает куда сохранить файл и передаёт загрузку в менеджер."""
         fname = download.downloadFileName() or "download"
         save_path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить файл",
@@ -2319,7 +2308,6 @@ class NostalgiaBrowser(QMainWindow):
         self._download_manager.add_download(download)
 
     def load_settings(self):
-        """Загружает закладки, историю, тему и прочие настройки из JSON-файла."""
         try:
             if os.path.exists('nostalgia_settings.json'):
                 with open('nostalgia_settings.json', 'r', encoding='utf-8') as f:
@@ -2365,7 +2353,6 @@ class NostalgiaBrowser(QMainWindow):
             print(f"Ошибка загрузки настроек: {e}")
 
     def save_settings(self):
-        """Сохраняет текущие настройки браузера в nostalgia_settings.json."""
         try:
             with open('nostalgia_settings.json', 'w', encoding='utf-8') as f:
                 json.dump({
@@ -2380,7 +2367,6 @@ class NostalgiaBrowser(QMainWindow):
             print(f"Ошибка сохранения настроек: {e}")
 
     def create_menubar(self):
-        """Строит главное меню: Файл, Вид, Избранное, Сервис, Справка."""
         mb = self.menuBar()
 
         fm = mb.addMenu("&Файл")
@@ -2448,6 +2434,11 @@ class NostalgiaBrowser(QMainWindow):
         a.setShortcut("Ctrl+D")
         a.triggered.connect(self.add_to_bookmarks)
         self.fav_menu.addAction(a)
+        
+        a = QAction("&Управление закладками...", self)
+        a.triggered.connect(self.show_bookmark_manager)
+        self.fav_menu.addAction(a)
+        
         self.fav_menu.addSeparator()
         self.fav_menu.aboutToShow.connect(self.update_bookmarks_menu)
 
@@ -2479,6 +2470,7 @@ class NostalgiaBrowser(QMainWindow):
         tm.addAction(a)
 
         a = QAction("🗑  &Очистить данные браузера...", self)
+        a.setShortcut("Ctrl+Shift+Del")
         a.triggered.connect(self.show_clear_data_dialog)
         tm.addAction(a)
 
@@ -2500,8 +2492,7 @@ class NostalgiaBrowser(QMainWindow):
         hm.addAction(a)
 
     def update_bookmarks_menu(self):
-        """Динамически обновляет список закладок в меню «Избранное»."""
-        for action in self.fav_menu.actions()[2:]:
+        for action in self.fav_menu.actions()[3:]:
             self.fav_menu.removeAction(action)
         for name, url in self.bookmarks.items():
             a = QAction(name, self)
@@ -2509,7 +2500,6 @@ class NostalgiaBrowser(QMainWindow):
             self.fav_menu.addAction(a)
 
     def create_toolbars(self):
-        """Создаёт панель навигации и адресную строку с кнопками управления."""
         self.nav_toolbar = QToolBar("Панель инструментов")
         self.nav_toolbar.setMovable(False)
         self.addToolBar(self.nav_toolbar)
@@ -2575,11 +2565,10 @@ class NostalgiaBrowser(QMainWindow):
         gb.clicked.connect(self.navigate_to_url)
         self.address_toolbar.addWidget(gb)
 
-        self.globe = GifLoadingWidget()
+        self.globe = EnhancedGifLoadingWidget()
         self.address_toolbar.addWidget(self.globe)
 
     def create_tabs(self):
-        """Создаёт виджет вкладок с возможностью закрытия и перетаскивания."""
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
@@ -2588,7 +2577,6 @@ class NostalgiaBrowser(QMainWindow):
         self.setCentralWidget(self.tab_widget)
 
     def setup_statusbar(self):
-        """Создаёт строку статуса с прогресс-баром, индикатором фильтра и зоной."""
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
@@ -2610,7 +2598,6 @@ class NostalgiaBrowser(QMainWindow):
         self.status_bar.addPermanentWidget(self.zone_label)
 
     def setup_shortcuts(self):
-        """Регистрирует глобальные горячие клавиши браузера."""
         QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close_current_tab)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.focus_url_bar)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_find_bar)
@@ -2621,13 +2608,17 @@ class NostalgiaBrowser(QMainWindow):
         QShortcut(QKeySequence("Ctrl+J"), self, activated=self.show_downloads)
         QShortcut(QKeySequence("Ctrl+Shift+N"), self, activated=self.open_incognito_tab)
         QShortcut(QKeySequence("Ctrl+Shift+Del"), self, activated=self.show_clear_data_dialog)
+        
+        # Горячие клавиши для переключения вкладок
+        QShortcut(QKeySequence("Ctrl+Tab"), self, activated=self.next_tab)
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, activated=self.prev_tab)
+        for i in range(1, 9):
+            QShortcut(QKeySequence(f"Ctrl+{i}"), self, activated=lambda idx=i-1: self.switch_to_tab(idx))
 
     def open_incognito_tab(self):
-        """Открывает новую вкладку в режиме инкогнито."""
         self.add_new_tab(QUrl(self.homepage), "🕵 Инкогнито", incognito=True)
 
     def add_new_tab(self, url=None, title="Новая вкладка", incognito: bool = False):
-        """Создаёт новую вкладку, подключает все сигналы и открывает URL."""
         if url is None:
             url = QUrl("about:blank")
         elif isinstance(url, str):
@@ -2670,7 +2661,6 @@ class NostalgiaBrowser(QMainWindow):
         return tab
 
     def _on_credentials_found(self, url: str, login: str, pwd: str):
-        """Предлагает сохранить перехваченный пароль если он ещё не сохранён."""
         existing = self.password_manager.find_for_url(url)
         for e in existing:
             if e['login'] == login:
@@ -2680,7 +2670,6 @@ class NostalgiaBrowser(QMainWindow):
             self.password_manager.add(url, login, pwd)
 
     def on_load_started(self, tab: BrowserTab):
-        """Запускает анимацию загрузки и прогресс-бар для вкладки."""
         if tab not in self.loading_tabs:
             w = TabLoadingWidget()
             self.loading_tabs[tab] = w
@@ -2696,7 +2685,6 @@ class NostalgiaBrowser(QMainWindow):
         self.status_label.setText("Поиск узла...")
 
     def on_load_finished(self, tab: BrowserTab, ok: bool):
-        """Останавливает анимацию и обновляет статус после завершения загрузки."""
         if tab in self.loading_tabs:
             self.loading_tabs[tab].stop()
             idx = self.tab_widget.indexOf(tab)
@@ -2720,10 +2708,19 @@ class NostalgiaBrowser(QMainWindow):
             self.status_label.setText("Ошибка загрузки")
 
     def update_progress(self, progress: int, tab: BrowserTab):
-        """Обновляет прогресс-бар и текст статуса для активной вкладки."""
         if self.tab_widget.currentWidget() is not tab:
             return
         self.progress_bar.setValue(progress)
+        
+        # Обновляем стадию загрузки для цветового индикатора
+        if tab in self.loading_tabs:
+            if progress < 30:
+                self.loading_tabs[tab].set_stage(0)  # Подключение
+            elif progress < 80:
+                self.loading_tabs[tab].set_stage(1)  # Загрузка
+            else:
+                self.loading_tabs[tab].set_stage(2)  # Отрисовка
+        
         if progress < 30:
             self.status_label.setText("Поиск узла...")
         elif progress < 60:
@@ -2734,13 +2731,18 @@ class NostalgiaBrowser(QMainWindow):
             self.status_label.setText("Завершение...")
 
     def on_url_changed(self, url: QUrl, tab: BrowserTab):
-        """Синхронизирует адресную строку, иконку HTTPS и добавляет запись в историю."""
         if self.tab_widget.currentWidget() is tab:
             self.url_bar.setText("" if url.scheme() == "nostalgia" else url.toString())
-            self.zone_label.setText(
-                "🔒 Надежный узел" if url.scheme() == "https"
-                else "Зона Интернета"
-            )
+            # Визуальная индикация безопасности URL
+            if url.scheme() == "https":
+                self.zone_label.setText("🔒 Надежный узел")
+                self.zone_label.setStyleSheet("color: green;")
+            elif url.scheme() == "http":
+                self.zone_label.setText("⚠ Не защищено")
+                self.zone_label.setStyleSheet("color: orange;")
+            else:
+                self.zone_label.setText("Зона Интернета")
+                self.zone_label.setStyleSheet("")
 
         if not tab.is_incognito and url.scheme() != "nostalgia":
             safe = sanitize_url_for_history(url.toString())
@@ -2752,11 +2754,14 @@ class NostalgiaBrowser(QMainWindow):
                 })
 
     def update_tab_title_by_tab(self, tab: BrowserTab, title: str):
-        """Обновляет заголовок вкладки и заголовок окна по новому title страницы."""
         idx = self.tab_widget.indexOf(tab)
         if idx < 0:
             return
         title = title[:500]
+        
+        # Устанавливаем всплывающую подсказку с полным заголовком
+        self.tab_widget.setTabToolTip(idx, title)
+        
         display = (title[:23] + "...") if len(title) > 25 else title
         if tab.is_incognito and not display.startswith("🕵"):
             display = "🕵 " + display
@@ -2771,12 +2776,10 @@ class NostalgiaBrowser(QMainWindow):
                 break
 
     def _sync_zoom_label(self, tab: BrowserTab):
-        """Обновляет метку масштаба в тулбаре при смене URL активной вкладки."""
         if self.tab_widget.currentWidget() is tab:
             self.zoom_label.setText(f"{int(tab.webview.zoomFactor()*100)}%")
 
     def _stop_loading_for_tab(self, tab: BrowserTab):
-        """Останавливает спиннер и прогресс-бар для конкретной вкладки."""
         if tab in self.loading_tabs:
             self.loading_tabs[tab].stop()
             idx = self.tab_widget.indexOf(tab)
@@ -2791,14 +2794,12 @@ class NostalgiaBrowser(QMainWindow):
             self.progress_bar.setVisible(False)
 
     def _on_site_blocked(self, tab: BrowserTab, domain: str):
-        """Останавливает загрузку и показывает диалог блокировки сайта."""
         self._stop_loading_for_tab(tab)
         self.status_label.setText("Сайт заблокирован")
         if self.site_filter.block_message:
             BlockedDialog(domain, self).exec()
 
     def _on_scheme_blocked(self, tab: BrowserTab, scheme: str):
-        """Останавливает загрузку и показывает диалог о неразрешённой схеме."""
         self._stop_loading_for_tab(tab)
         self.status_label.setText(
             f"Заблокировано: схема «{scheme}» не разрешена"
@@ -2806,7 +2807,6 @@ class NostalgiaBrowser(QMainWindow):
         SchemeBlockedDialog(scheme, self).exec()
 
     def navigate_to_url(self):
-        """Обрабатывает ввод в адресной строке: URL, домен или поисковый запрос."""
         text = self.url_bar.text().strip()
         if not text:
             return
@@ -2831,7 +2831,6 @@ class NostalgiaBrowser(QMainWindow):
             self.status_label.setText(f"Ошибка: {e}")
 
     def load_url(self, url):
-        """Загружает URL в текущую вкладку, предварительно проверив безопасность."""
         if isinstance(url, str):
             url = QUrl(url)
         if not is_safe_url(url) and url.scheme() != "nostalgia":
@@ -2844,19 +2843,16 @@ class NostalgiaBrowser(QMainWindow):
             wv.setUrl(url)
 
     def go_back(self):
-        """Переходит на предыдущую страницу в истории текущей вкладки."""
         wv = self.get_current_webview()
         if wv:
             wv.back()
 
     def go_forward(self):
-        """Переходит на следующую страницу в истории текущей вкладки."""
         wv = self.get_current_webview()
         if wv:
             wv.forward()
 
     def stop_loading(self):
-        """Останавливает загрузку текущей страницы."""
         wv = self.get_current_webview()
         if wv:
             wv.stop()
@@ -2866,34 +2862,34 @@ class NostalgiaBrowser(QMainWindow):
         self.status_label.setText("Загрузка остановлена")
 
     def reload_page(self):
-        """Перезагружает текущую страницу."""
         wv = self.get_current_webview()
         if wv:
             wv.reload()
 
     def go_home(self):
-        """Открывает домашнюю страницу в текущей вкладке."""
         self.load_url(self.homepage)
 
     def focus_url_bar(self):
-        """Выделяет весь текст в адресной строке и ставит на неё фокус."""
         self.url_bar.selectAll()
         self.url_bar.setFocus()
 
     def tab_changed(self, index: int):
-        """Синхронизирует адресную строку и метку масштаба при переключении вкладки."""
         tab = self.tab_widget.widget(index)
         if isinstance(tab, BrowserTab):
             url = tab.webview.url()
             self.url_bar.setText("" if url.scheme() == "nostalgia" else url.toString())
-            self.zone_label.setText(
-                "🔒 Надежный узел" if url.scheme() == "https"
-                else "Зона Интернета"
-            )
+            if url.scheme() == "https":
+                self.zone_label.setText("🔒 Надежный узел")
+                self.zone_label.setStyleSheet("color: green;")
+            elif url.scheme() == "http":
+                self.zone_label.setText("⚠ Не защищено")
+                self.zone_label.setStyleSheet("color: orange;")
+            else:
+                self.zone_label.setText("Зона Интернета")
+                self.zone_label.setStyleSheet("")
             self.zoom_label.setText(f"{int(tab.webview.zoomFactor()*100)}%")
 
     def close_tab(self, index: int):
-        """Закрывает вкладку или предлагает выйти из браузера если вкладка последняя."""
         if self.tab_widget.count() > 1:
             tab = self.tab_widget.widget(index)
             if tab:
@@ -2920,16 +2916,30 @@ class NostalgiaBrowser(QMainWindow):
                 QApplication.quit()
 
     def close_current_tab(self):
-        """Закрывает текущую активную вкладку."""
         self.close_tab(self.tab_widget.currentIndex())
+    
+    def next_tab(self):
+        """Переключение на следующую вкладку."""
+        current = self.tab_widget.currentIndex()
+        next_idx = (current + 1) % self.tab_widget.count()
+        self.tab_widget.setCurrentIndex(next_idx)
+    
+    def prev_tab(self):
+        """Переключение на предыдущую вкладку."""
+        current = self.tab_widget.currentIndex()
+        prev_idx = (current - 1) % self.tab_widget.count()
+        self.tab_widget.setCurrentIndex(prev_idx)
+    
+    def switch_to_tab(self, index: int):
+        """Переключение на вкладку по индексу (0-7)."""
+        if 0 <= index < self.tab_widget.count():
+            self.tab_widget.setCurrentIndex(index)
 
     def get_current_webview(self) -> QWebEngineView | None:
-        """Возвращает WebView текущей вкладки или None если вкладки нет."""
         tab = self.tab_widget.currentWidget()
         return tab.webview if isinstance(tab, BrowserTab) else None
 
     def _set_zoom(self, factor: float):
-        """Устанавливает масштаб страницы в диапазоне 25%–500%."""
         wv = self.get_current_webview()
         if wv:
             factor = max(0.25, min(5.0, factor))
@@ -2937,23 +2947,19 @@ class NostalgiaBrowser(QMainWindow):
             self.zoom_label.setText(f"{int(factor*100)}%")
 
     def zoom_in(self):
-        """Увеличивает масштаб на 10%."""
         wv = self.get_current_webview()
         if wv:
             self._set_zoom(wv.zoomFactor() + 0.1)
 
     def zoom_out(self):
-        """Уменьшает масштаб на 10%."""
         wv = self.get_current_webview()
         if wv:
             self._set_zoom(wv.zoomFactor() - 0.1)
 
     def zoom_reset(self):
-        """Сбрасывает масштаб до 100%."""
         self._set_zoom(1.0)
 
     def _toggle_popup_blocking(self, checked: bool):
-        """Включает или отключает блокировку попапов для всех открытых вкладок."""
         self.block_popups = checked
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
@@ -2966,18 +2972,15 @@ class NostalgiaBrowser(QMainWindow):
         )
 
     def show_filter_settings(self):
-        """Открывает диалог фильтрации и обновляет индикатор в строке статуса."""
         if FilterDialog(self.site_filter, self).exec():
             self.update_filter_indicator()
 
     def update_filter_indicator(self):
-        """Показывает или скрывает иконку «Фильтр вкл.» в строке статуса."""
         self.filter_status.setText(
             "🔒 Фильтр вкл." if self.site_filter.filter_enabled else ""
         )
 
     def show_homepage_settings(self):
-        """Открывает диалог смены домашней страницы и сохраняет результат."""
         dlg = HomepageDialog(self.homepage, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_hp = dlg.homepage
@@ -2987,7 +2990,6 @@ class NostalgiaBrowser(QMainWindow):
                 self.status_label.setText(f"Домашняя страница: {new_hp}")
 
     def show_theme_dialog(self):
-        """Открывает диалог тем и применяет выбранную тему к приложению."""
         dlg = ThemeDialog(self.current_theme, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.current_theme = dlg.selected_theme
@@ -2996,7 +2998,6 @@ class NostalgiaBrowser(QMainWindow):
             self.status_label.setText(f"Тема: {self.current_theme}")
 
     def show_search_engine_dialog(self):
-        """Открывает диалог выбора поисковика и сохраняет выбор."""
         dlg = SearchEngineDialog(self.current_engine, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.current_engine = dlg.selected
@@ -3006,25 +3007,39 @@ class NostalgiaBrowser(QMainWindow):
             )
 
     def show_cookie_manager(self):
-        """Открывает менеджер cookie для профиля текущей вкладки."""
         tab = self.tab_widget.currentWidget()
         profile = QWebEngineProfile.defaultProfile()
         if isinstance(tab, BrowserTab) and tab.is_incognito:
             profile = IncognitoProfile.get()
-        dlg = CookieManagerDialog(profile, self)
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        
+        # Создаем простой диалог для cookie
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Управление cookie - Nostalgia")
+        dlg.resize(600, 400)
+        layout = QVBoxLayout(dlg)
+        
+        label = QLabel("Управление cookie через настройки браузера.\nДля удаления всех cookie используйте «Очистить данные браузера» (Ctrl+Shift+Del).")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        
+        btn = QPushButton("Закрыть")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        
+        dlg.exec()
 
     def show_password_manager(self):
-        """Открывает менеджер сохранённых паролей."""
         dlg = PasswordManagerDialog(self.password_manager, self)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+    
+    def show_bookmark_manager(self):
+        dlg = BookmarkManagerDialog(self.bookmarks, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.save_settings()
 
     def show_clear_data_dialog(self):
-        """Открывает диалог очистки данных и выполняет выбранные операции."""
         dlg = ClearDataDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3051,8 +3066,7 @@ class NostalgiaBrowser(QMainWindow):
                 print(f"Ошибка очистки кэша: {e}")
 
         if dlg.clear_passwords:
-            while self.password_manager.entries():
-                self.password_manager.remove(0)
+            self.password_manager.clear_all()
             cleared.append("пароли")
 
         if dlg.clear_bookmarks:
@@ -3068,7 +3082,6 @@ class NostalgiaBrowser(QMainWindow):
         )
 
     def show_downloads(self):
-        """Открывает или показывает окно менеджера загрузок."""
         if self._download_manager is None:
             self._download_manager = DownloadManagerDialog(self)
         self._download_manager.show()
@@ -3076,14 +3089,12 @@ class NostalgiaBrowser(QMainWindow):
         self._download_manager.activateWindow()
 
     def open_find_bar(self):
-        """Открывает панель поиска по странице для текущей вкладки."""
         tab = self.tab_widget.currentWidget()
         if isinstance(tab, BrowserTab):
             tab.find_bar.set_webview(tab.webview)
             tab.find_bar.open_bar()
 
     def add_to_bookmarks(self):
-        """Добавляет текущую страницу в закладки с запросом названия."""
         wv = self.get_current_webview()
         if wv:
             url = wv.url()
@@ -3103,7 +3114,6 @@ class NostalgiaBrowser(QMainWindow):
                 self.status_label.setText("Добавлено в избранное")
 
     def show_history(self):
-        """Открывает диалог просмотра истории с возможностью перехода на страницу."""
         dlg = QDialog(self)
         dlg.setWindowTitle("История - Nostalgia")
         dlg.resize(600, 400)
@@ -3114,7 +3124,15 @@ class NostalgiaBrowser(QMainWindow):
             url_str = e.get('url', '')
             if not sanitize_url_for_history(url_str):
                 continue
-            text = f"{e.get('title') or url_str}  —  {url_str}"
+            title = e.get('title', '')
+            time_str = ""
+            if e.get('time'):
+                try:
+                    dt = datetime.datetime.fromisoformat(e['time'])
+                    time_str = f" [{dt.strftime('%d.%m.%Y %H:%M')}]"
+                except:
+                    pass
+            text = f"{title or url_str}{time_str}  —  {url_str}"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, url_str)
             lw.addItem(item)
@@ -3139,26 +3157,33 @@ class NostalgiaBrowser(QMainWindow):
         dlg.exec()
 
     def show_search(self):
-        """Открывает диалог быстрого поиска и загружает результаты."""
         text, ok = QInputDialog.getText(self, "Поиск", "Введите запрос:")
         if ok and text:
             tmpl = SEARCH_ENGINES.get(self.current_engine, SEARCH_ENGINES["Google"])
             self.load_url(tmpl.replace("{query}", quote_plus(text)))
 
     def toggle_fullscreen(self):
-        """Переключает полноэкранный режим."""
         if self.isFullScreen():
             self.showNormal()
         else:
             self.showFullScreen()
 
     def show_about(self):
-        """Показывает диалог «О программе» со списком возможностей."""
         QMessageBox.about(
             self, "О программе",
-            "Nostalgia Browser v0.1 Alpha\n\n"
+            "Nostalgia Browser v0.2 Alpha\n\n"
             "Вдохновлен Internet Explorer 5.5\n"
             "Стиль: Windows 98 Classic\n\n"
+            "Новые возможности v0.2:\n"
+            "• Безопасное шифрование паролей (AES-128)\n"
+            "• Проверка SSL сертификатов\n"
+            "• Горячие клавиши для вкладок (Ctrl+Tab, Ctrl+1..8)\n"
+            "• Улучшенный GIF-загрузчик с анимацией\n"
+            "• Цветовая индикация загрузки на вкладках\n"
+            "• Всплывающие подсказки для длинных URL\n"
+            "• Импорт/экспорт закладок в HTML\n"
+            "• Менеджер закладок\n"
+            "• Подтверждение при закрытии нескольких вкладок\n\n"
             "MVP функции:\n"
             "• Поиск на странице (Ctrl+F)\n"
             "• Менеджер загрузок (Ctrl+J)\n"
@@ -3166,18 +3191,21 @@ class NostalgiaBrowser(QMainWindow):
             "• Масштабирование (Ctrl+/- /0)\n"
             "• Настройка домашней страницы\n"
             "• Блокировка всплывающих окон\n\n"
-            "Дополнительно:\n"
-            "• Режим инкогнито (Ctrl+Shift+N)\n"
-            "• Очистка данных (Ctrl+Shift+Del)\n"
-            "• 6 поисковых систем\n"
-            "• Управление cookie\n"
-            "• Менеджер паролей\n"
-            "• 5 тем оформления\n\n"
             "© 2026 Nostalgia Project"
         )
 
     def closeEvent(self, event):
-        """Сохраняет настройки и останавливает анимации перед закрытием окна."""
+        # Подтверждение при закрытии нескольких вкладок
+        if self.tab_widget.count() > 1:
+            reply = QMessageBox.question(
+                self, "Подтверждение выхода",
+                f"Закрыть {self.tab_widget.count()} вкладок и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        
         self.save_settings()
         self.site_filter.save_lists()
         if hasattr(self, 'globe'):
@@ -3188,22 +3216,22 @@ class NostalgiaBrowser(QMainWindow):
 
 
 def main():
-    """Точка входа: создаёт приложение, применяет тему и запускает главное окно."""
     app = QApplication(sys.argv)
     app.setApplicationName("Nostalgia Browser")
     app.open_folder = lambda path: None
-
+    
+    # Устанавливаем шрифт
     font = QFont("MS Sans Serif", 8)
     if "Tahoma" in QFontDatabase.families():
         font = QFont("Tahoma", 8)
     app.setFont(font)
-
-    NostalgiaStyle.apply_style(app)
-
+    
+    # Создаем и показываем браузер
     browser = NostalgiaBrowser()
     apply_theme(app, browser.current_theme)
     app.open_folder = browser.open_folder
     browser.show()
+    
     sys.exit(app.exec())
 
 
