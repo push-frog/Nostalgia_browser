@@ -1,0 +1,8 @@
+{
+  "blacklist": [],
+  "whitelist": [],
+  "use_whitelist": false,
+  "use_blacklist": true,
+  "filter_enabled": true,
+  "block_message": true
+}
