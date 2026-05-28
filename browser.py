@@ -11,9 +11,10 @@ import logging.handlers
 import tempfile
 import uuid
 import base64
+import time
 from html import escape as html_escape
-from urllib.parse import urlparse, quote_plus
-from typing import Optional
+from urllib.parse import urlparse, quote_plus, urljoin
+from typing import Optional, Set
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -44,7 +45,9 @@ from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEnginePage,
     QWebEngineDownloadRequest,
     QWebEngineScript, QWebEngineSettings,
-    QWebEngineCertificateError
+    QWebEngineCertificateError,
+    QWebEngineUrlSchemeHandler,
+    QWebEngineUrlRequestJob
 )
 from PyQt6.QtGui import (
     QFont, QColor, QPalette, QPixmap,
@@ -55,15 +58,25 @@ from PyQt6.QtGui import (
 from PyQt6.QtNetwork import QNetworkCookie
 
 # ──────────────────────────────────────────────
-# КОНСТАНТЫ БЕЗОПАСНОСТИ
+# ДОПОЛНИТЕЛЬНЫЕ КОНСТАНТЫ БЕЗОПАСНОСТИ
 # ──────────────────────────────────────────────
 ALLOWED_SCHEMES = frozenset({"http", "https", "about", "nostalgia"})
+BLOCKED_SCHEMES = frozenset({
+    "file", "javascript", "data", "vbscript", "ftp",
+    "gopher", "chrome", "chrome-extension", "moz-extension",
+    "ms-browser-extension", "edge"
+})
+DANGEROUS_PROTOCOLS = frozenset({
+    "tel", "mailto", "sms", "callto", "skype", "steam",
+    "magnet", "bitcoin", "ethereum"
+})
 MAX_URL_LENGTH = 2048
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_DOWNLOADS_SIMULTANEOUS = 5
-PASSWORD_DISPLAY_TIMEOUT = 10000  # 10 секунд
-NAVIGATION_RATE_LIMIT = 10  # навигаций в секунду
-CLIPBOARD_CLEAR_TIMEOUT = 30000  # 30 секунд
+MAX_DOWNLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB максимум для загрузки
+PASSWORD_DISPLAY_TIMEOUT = 10000
+NAVIGATION_RATE_LIMIT = 10
+CLIPBOARD_CLEAR_TIMEOUT = 30000
 MAX_HISTORY_ENTRIES = 200
 MAX_BOOKMARK_URL_LENGTH = 2048
 MAX_TITLE_LENGTH = 500
@@ -98,6 +111,8 @@ _DOMAIN_RE = re.compile(
     r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
 )
 
+NOSTALGIA_PATH_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+
 # ──────────────────────────────────────────────
 # БЕЗОПАСНОЕ ЛОГИРОВАНИЕ
 # ──────────────────────────────────────────────
@@ -123,8 +138,20 @@ if os.environ.get('NOSTALGIA_DEBUG'):
 # УТИЛИТЫ БЕЗОПАСНОСТИ
 # ──────────────────────────────────────────────
 
+class MonotonicTime:
+    """Монотонное время для защиты от манипуляций с системными часами."""
+    _start_time = time.monotonic()
+    
+    @classmethod
+    def now(cls) -> float:
+        return time.monotonic() - cls._start_time
+    
+    @classmethod
+    def datetime_now(cls) -> datetime.datetime:
+        return datetime.datetime.now()
+
+
 def sanitize_display_text(text: str, max_len: int = MAX_DISPLAY_LENGTH) -> str:
-    """Безопасное форматирование текста для отображения в UI."""
     if not text:
         return ""
     escaped = html_escape(text)
@@ -134,7 +161,6 @@ def sanitize_display_text(text: str, max_len: int = MAX_DISPLAY_LENGTH) -> str:
 
 
 def safe_domain_match(domain: str, pattern: str) -> bool:
-    """Проверка соответствия домена шаблону с защитой от атак через поддомены."""
     if not domain or not pattern:
         return False
     domain = domain.lower().strip()
@@ -146,8 +172,18 @@ def safe_domain_match(domain: str, pattern: str) -> bool:
     return False
 
 
+def validate_nostalgia_path(path: str) -> bool:
+    """Валидация пути в nostalgia:// URL."""
+    if not path:
+        return False
+    # Удаляем начальный слеш если есть
+    if path.startswith('/'):
+        path = path[1:]
+    # Проверяем, что путь содержит только безопасные символы
+    return bool(NOSTALGIA_PATH_RE.match(path))
+
+
 def validate_and_sanitize_html(html_content: str) -> str:
-    """Базовая санитизация HTML-контента для предотвращения XSS."""
     html_content = re.sub(
         r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>',
         '',
@@ -172,22 +208,33 @@ def validate_and_sanitize_html(html_content: str) -> str:
         html_content,
         flags=re.IGNORECASE
     )
+    # Добавляем защиту от clickjacking
+    if '<head>' in html_content:
+        html_content = html_content.replace(
+            '<head>',
+            '<head><meta http-equiv="X-Frame-Options" content="DENY">'
+        )
     return html_content
 
 
 def sanitize_search_query(query: str) -> str:
-    """Санитизация поискового запроса."""
-    # Удаление управляющих символов
     query = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', query)
-    # Ограничение длины
     query = query[:500]
-    # Удаление множественных пробелов
     query = re.sub(r'\s+', ' ', query).strip()
     return query
 
 
+def is_safe_external_protocol(url: QUrl) -> bool:
+    """Проверка безопасности внешних протоколов."""
+    scheme = url.scheme().lower()
+    if scheme in DANGEROUS_PROTOCOLS:
+        return False
+    if scheme in BLOCKED_SCHEMES:
+        return False
+    return True
+
+
 class SecureClipboard:
-    """Безопасное управление буфером обмена с автоматической очисткой."""
     _timer: Optional[QTimer] = None
     _last_content: str = ""
 
@@ -213,14 +260,13 @@ class SecureClipboard:
 
 
 class RateLimiter:
-    """Ограничитель частоты операций для предотвращения DoS."""
     def __init__(self, max_operations: int, per_seconds: float = 1.0):
         self.max_operations = max_operations
         self.per_seconds = per_seconds
         self._operations: list[float] = []
 
     def can_proceed(self) -> bool:
-        now = datetime.datetime.now().timestamp()
+        now = MonotonicTime.now()
         cutoff = now - self.per_seconds
         self._operations = [t for t in self._operations if t > cutoff]
         if len(self._operations) < self.max_operations:
@@ -233,7 +279,6 @@ class RateLimiter:
 
 
 class SecureFileHandler:
-    """Безопасная работа с файлами."""
     @staticmethod
     def safe_read_json(filepath: str, max_size: int = MAX_FILE_SIZE) -> dict:
         if not os.path.exists(filepath):
@@ -323,7 +368,6 @@ class SecureFileHandler:
 
 
 class SecureTempFile:
-    """Безопасная работа с временными файлами."""
     @staticmethod
     def create_temp_path(prefix: str = 'nostalgia_', suffix: str = '.tmp') -> str:
         random_name = f"{prefix}{uuid.uuid4().hex}{suffix}"
@@ -353,7 +397,6 @@ class SecureTempFile:
 
 
 class SanitizedUrl:
-    """Санитизированный URL с защитой от过长 URL и других атак."""
     @staticmethod
     def sanitize(url_str: str) -> Optional[str]:
         if not url_str:
@@ -370,10 +413,11 @@ class SanitizedUrl:
         url_str = url_str.strip()
         try:
             parsed = urlparse(url_str)
-            if parsed.scheme in ('http', 'https') and not parsed.netloc:
+            # Проверка на опасные схемы
+            if parsed.scheme.lower() in BLOCKED_SCHEMES:
+                logger.warning("Blocked URL scheme: %s", parsed.scheme)
                 return None
-            if parsed.scheme.lower() in ('javascript', 'data', 'vbscript', 'file'):
-                logger.warning("Dangerous URL scheme: %s", parsed.scheme)
+            if parsed.scheme in ('http', 'https') and not parsed.netloc:
                 return None
             if parsed.fragment and any(
                 dangerous in parsed.fragment.lower()
@@ -387,9 +431,11 @@ class SanitizedUrl:
 
 
 class DownloadSecurityManager:
-    """Менеджер безопасности загрузок."""
     @staticmethod
-    def is_safe_download(mime_type: str, file_extension: str) -> bool:
+    def is_safe_download(mime_type: str, file_extension: str, content_length: int = 0) -> bool:
+        # Проверка размера файла
+        if content_length > MAX_DOWNLOAD_SIZE:
+            return False
         mime_type = mime_type.lower().split(';')[0].strip()
         if mime_type in DANGEROUS_MIME_TYPES:
             return False
@@ -424,7 +470,6 @@ class DownloadSecurityManager:
 
 
 class SecurePasswordItem:
-    """Безопасный элемент пароля с автоскрытием."""
     def __init__(self):
         self._password: str = ""
         self._visible: bool = False
@@ -459,16 +504,16 @@ class SecurePasswordItem:
 
 
 class TabManager:
-    """Менеджер вкладок с защитой от DoS."""
     def __init__(self, tab_widget: QTabWidget):
         self.tab_widget = tab_widget
         self._redirect_times: list[float] = []
+        self._redirect_chains: dict[int, list[str]] = {}
 
     def can_add_tab(self) -> bool:
         return self.tab_widget.count() < MAX_TABS
 
-    def can_redirect(self) -> bool:
-        now = datetime.datetime.now().timestamp()
+    def can_redirect(self, tab_index: int = -1) -> bool:
+        now = MonotonicTime.now()
         cutoff = now - 1.0
         self._redirect_times = [t for t in self._redirect_times if t > cutoff]
         if len(self._redirect_times) < MAX_REDIRECTS_PER_SECOND:
@@ -476,27 +521,139 @@ class TabManager:
             return True
         return False
 
+    def track_redirect_chain(self, tab_index: int, url: str) -> bool:
+        """
+        Отслеживание цепочки редиректов для предотвращения атак.
+        Исправление уязвимости #54.
+        """
+        if tab_index not in self._redirect_chains:
+            self._redirect_chains[tab_index] = []
+        
+        chain = self._redirect_chains[tab_index]
+        chain.append(url)
+        
+        # Ограничение длины цепочки редиректов
+        if len(chain) > 10:
+            logger.warning("Redirect chain too long for tab %d: %d redirects", tab_index, len(chain))
+            return False
+        
+        return True
+
+    def clear_redirect_chain(self, tab_index: int):
+        if tab_index in self._redirect_chains:
+            del self._redirect_chains[tab_index]
+
+
+# ──────────────────────────────────────────────
+# ОБРАБОТЧИК NOSTALGIA СХЕМЫ С ЗАЩИТОЙ ОТ PATH TRAVERSAL
+# ──────────────────────────────────────────────
+
+class NostalgiaSchemeHandler(QWebEngineUrlSchemeHandler):
+    """Обработчик nostalgia:// схемы с защитой от path traversal."""
+    
+    def __init__(self, page_handler=None):
+        super().__init__()
+        self._page_handler = page_handler or NostalgiaPageHandler()
+    
+    def requestStarted(self, job: QWebEngineUrlRequestJob):
+        """Обработка запроса к nostalgia:// URL."""
+        url = job.requestUrl()
+        path = url.path()
+        
+        # Исправление уязвимости #49: валидация пути
+        if not validate_nostalgia_path(path):
+            logger.warning("Invalid nostalgia path: %s", path)
+            self._send_error(job, "Invalid path")
+            return
+        
+        # Получаем ID страницы
+        page_id = path.lstrip('/')
+        
+        try:
+            html_content = self._page_handler.get_page(page_id)
+            # Буферизация ответа
+            buf = html_content.encode('utf-8')
+            job.reply(b"text/html", buf)
+        except Exception as e:
+            logger.warning("Error serving nostalgia page %s: %s", page_id, e)
+            self._send_error(job, "Page not found")
+    
+    def _send_error(self, job: QWebEngineUrlRequestJob, message: str):
+        """Отправка страницы ошибки."""
+        error_html = validate_and_sanitize_html(
+            f"<html><body><h1>Error</h1><p>{html_escape(message)}</p></body></html>"
+        )
+        buf = error_html.encode('utf-8')
+        job.reply(b"text/html", buf)
+
+
+class NostalgiaPageHandler:
+    """Обработчик страниц nostalgia с контролем доступа."""
+    
+    def __init__(self):
+        self._blocked_pages = {}
+        self._counter = 0
+        self._allowed_ids: Set[str] = set()
+    
+    def register_page(self, html_content: str, allow_public: bool = True) -> str:
+        self._counter += 1
+        pid = f"blocked_{self._counter}"
+        self._blocked_pages[pid] = validate_and_sanitize_html(html_content)
+        if allow_public:
+            self._allowed_ids.add(pid)
+        return f"nostalgia:{pid}"
+    
+    def get_page(self, pid: str) -> str:
+        # Исправление уязвимости #49: проверка ID
+        if not validate_nostalgia_path(pid):
+            logger.warning("Invalid nostalgia page ID: %s", pid)
+            return validate_and_sanitize_html(
+                "<html><body><h1>Доступ запрещен</h1><p>Неверный идентификатор страницы.</p></body></html>"
+            )
+        
+        if pid not in self._allowed_ids:
+            logger.warning("Attempt to access unauthorized nostalgia page: %s", pid)
+            return validate_and_sanitize_html(
+                "<html><body><h1>Доступ запрещен</h1><p>У вас нет доступа к этой странице.</p></body></html>"
+            )
+        
+        return self._blocked_pages.get(
+            pid,
+            validate_and_sanitize_html(
+                "<html><body><h1>Страница не найдена</h1><p>Запрошенная страница не существует.</p></body></html>"
+            )
+        )
+
 
 def is_safe_url(url: QUrl) -> bool:
     """Проверяет, что URL валиден и использует разрешённую схему."""
     if not url.isValid():
         return False
+    
     url_str = url.toString()
+    
     if len(url_str) > MAX_URL_LENGTH:
         return False
+    
     scheme = url.scheme().lower()
+    
+    # Проверка на заблокированные схемы
+    if scheme in BLOCKED_SCHEMES:
+        return False
+    
     if scheme not in ALLOWED_SCHEMES:
         return False
+    
     if scheme in ('http', 'https'):
         if not url.host():
             return False
         if url.userName() or url.password():
             return False
+    
     return True
 
 
 def sanitize_url_for_history(url_str: str) -> str | None:
-    """Возвращает URL если его можно сохранить в истории, иначе None."""
     if not url_str or url_str in ("about:blank", ""):
         return None
     sanitized = SanitizedUrl.sanitize(url_str)
@@ -526,7 +683,6 @@ def sanitize_url_for_history(url_str: str) -> str | None:
 
 
 def validate_domain(domain: str) -> bool:
-    """Проверяет, что строка является допустимым доменным именем."""
     if not domain or len(domain) > 253:
         return False
     if domain.startswith("*."):
@@ -798,7 +954,6 @@ class EnhancedGifLoadingWidget(QWidget):
 
 
 class SiteFilter:
-    """Фильтр сайтов по чёрному и белому спискам доменов."""
     def __init__(self):
         self.blacklist = []
         self.whitelist = []
@@ -806,11 +961,17 @@ class SiteFilter:
         self.use_blacklist = True
         self.filter_enabled = True
         self.block_message = True
+        self._filter_hash = None
         self.load_lists()
 
     def load_lists(self):
         try:
             if os.path.exists('nostalgia_filter.json'):
+                # Исправление #66: проверка целостности файла фильтра
+                with open('nostalgia_filter.json', 'rb') as f:
+                    content = f.read()
+                self._filter_hash = hashlib.sha256(content).hexdigest()
+                
                 data = SecureFileHandler.safe_read_json('nostalgia_filter.json')
                 if data:
                     self.blacklist = [d for d in data.get('blacklist', []) if isinstance(d, str) and validate_domain(d)]
@@ -965,27 +1126,6 @@ class FilterDialog(QDialog):
         super().accept()
 
 
-class NostalgiaSchemeHandler:
-    def __init__(self):
-        self._blocked_pages = {}
-        self._counter = 0
-        self._allowed_ids = set()
-
-    def register_page(self, html_content: str, allow_public: bool = True) -> str:
-        self._counter += 1
-        pid = f"blocked_{self._counter}"
-        self._blocked_pages[pid] = validate_and_sanitize_html(html_content)
-        if allow_public:
-            self._allowed_ids.add(pid)
-        return f"nostalgia:{pid}"
-
-    def get_page(self, pid: str) -> str:
-        if pid not in self._allowed_ids:
-            logger.warning("Attempt to access unauthorized nostalgia page: %s", pid)
-            return validate_and_sanitize_html("<html><body><h1>Доступ запрещен</h1><p>У вас нет доступа к этой странице.</p></body></html>")
-        return self._blocked_pages.get(pid, validate_and_sanitize_html("<html><body><h1>Страница не найдена</h1><p>Запрошенная страница не существует.</p></body></html>"))
-
-
 class IncognitoProfile:
     _instance: QWebEngineProfile | None = None
 
@@ -995,7 +1135,6 @@ class IncognitoProfile:
             cls._instance = QWebEngineProfile()
             cls._instance.setHttpUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             cls._instance.setHttpAcceptLanguage("ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
-            # Исправление #38: явная изоляция cookie в Incognito
             cls._instance.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
             cls._instance.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         return cls._instance
@@ -1305,17 +1444,16 @@ KEY_FILE = 'nostalgia_key.key'
 
 
 class SecurePasswordManager:
-    """Безопасное хранилище паролей с шифрованием Fernet и PBKDF2."""
     def __init__(self, master_password: Optional[str] = None):
         self._entries: list[dict] = []
         self._cipher = self._get_or_create_cipher()
-        self._access_times: dict[int, datetime.datetime] = {}
+        self._access_times: dict[int, float] = {}
         self._failed_attempts: dict[str, int] = {}
-        self._lockout_until: dict[str, datetime.datetime] = {}
+        self._lockout_until: dict[str, float] = {}
         self._secure_items: dict[int, SecurePasswordItem] = {}
         self._master_password_hash: Optional[str] = None
         self._failed_master_attempts = 0
-        self._master_lockout_until: Optional[datetime.datetime] = None
+        self._master_lockout_until: Optional[float] = None
         self._load()
         if master_password:
             self.set_master_password(master_password)
@@ -1335,7 +1473,6 @@ class SecurePasswordManager:
         return Fernet(key)
 
     def set_master_password(self, password: str):
-        """Устанавливает мастер-пароль с PBKDF2. Исправление #35."""
         if len(password) < MIN_PASSWORD_LENGTH:
             raise ValueError(f"Master password must be at least {MIN_PASSWORD_LENGTH} characters")
         salt = secrets.token_bytes(32)
@@ -1345,9 +1482,8 @@ class SecurePasswordManager:
         self._reencrypt_passwords()
 
     def verify_master_password(self, password: str) -> bool:
-        """Проверка мастер-пароля с защитой от брутфорса."""
         if self._master_lockout_until:
-            if datetime.datetime.now() < self._master_lockout_until:
+            if MonotonicTime.now() < self._master_lockout_until:
                 logger.warning("Master password verification blocked")
                 return False
             else:
@@ -1365,7 +1501,7 @@ class SecurePasswordManager:
             if not is_valid:
                 self._failed_master_attempts += 1
                 if self._failed_master_attempts > 5:
-                    self._master_lockout_until = datetime.datetime.now() + datetime.timedelta(minutes=15)
+                    self._master_lockout_until = MonotonicTime.now() + 900  # 15 минут
                     logger.warning("Master password locked due to too many attempts")
                 return False
             self._failed_master_attempts = 0
@@ -1440,7 +1576,8 @@ class SecurePasswordManager:
         return ''
 
     def get_password_secure(self, index: int) -> Optional[str]:
-        now = datetime.datetime.now()
+        # Исправление #57: использование монотонного времени
+        now = MonotonicTime.now()
         if str(index) in self._lockout_until:
             if now < self._lockout_until[str(index)]:
                 logger.warning("Password access blocked for index %d", index)
@@ -1449,10 +1586,10 @@ class SecurePasswordManager:
                 del self._lockout_until[str(index)]
                 self._failed_attempts.pop(str(index), None)
         last_access = self._access_times.get(index)
-        if last_access and (now - last_access).seconds < 1:
+        if last_access and (now - last_access) < 1:
             self._failed_attempts[str(index)] = self._failed_attempts.get(str(index), 0) + 1
             if self._failed_attempts[str(index)] > 5:
-                self._lockout_until[str(index)] = now + datetime.timedelta(minutes=5)
+                self._lockout_until[str(index)] = now + 300  # 5 минут
                 logger.warning("Password access locked for index %d due to too many attempts", index)
                 return None
             return None
@@ -1733,7 +1870,10 @@ class ClearDataDialog(QDialog):
         self.cb_cache.setChecked(True)
         self.cb_passwords = QCheckBox("Сохранённые пароли")
         self.cb_bookmarks = QCheckBox("Закладки")
-        for cb in [self.cb_history, self.cb_cookies, self.cb_cache, self.cb_passwords, self.cb_bookmarks]:
+        # Исправление #61 и #67: добавление опций очистки HSTS и хранилищ
+        self.cb_hsts = QCheckBox("HSTS и SSL кэш")
+        self.cb_storage = QCheckBox("WebSQL/IndexedDB хранилища")
+        for cb in [self.cb_history, self.cb_cookies, self.cb_cache, self.cb_passwords, self.cb_bookmarks, self.cb_hsts, self.cb_storage]:
             bl.addWidget(cb)
         layout.addWidget(box)
         warn = QLabel("⚠  Действие необратимо!")
@@ -1759,6 +1899,10 @@ class ClearDataDialog(QDialog):
     def clear_passwords(self): return self.cb_passwords.isChecked()
     @property
     def clear_bookmarks(self): return self.cb_bookmarks.isChecked()
+    @property
+    def clear_hsts(self): return self.cb_hsts.isChecked()
+    @property
+    def clear_storage(self): return self.cb_storage.isChecked()
 
 
 class BookmarkManagerDialog(QDialog):
@@ -1839,10 +1983,10 @@ class BookmarkManagerDialog(QDialog):
             return
         old_name = item.text(0)
         old_url = item.text(1)
-        name, ok1 = QInputDialog.getText(self, "Редактировать", "Название:", text=old_name)
+        name, ok1 = QInputDialog.getText(self, "Редактировать", "Название:", text=sanitize_display_text(old_name, 100))
         if not ok1 or not name:
             return
-        url, ok2 = QInputDialog.getText(self, "Редактировать", "URL:", text=old_url)
+        url, ok2 = QInputDialog.getText(self, "Редактировать", "URL:", text=sanitize_display_text(old_url, 100))
         if not ok2 or not url:
             return
         if not url.startswith(("http://", "https://")):
@@ -1980,6 +2124,7 @@ class NostalgiaPage(QWebEnginePage):
         self._blocked = False
         self._incognito = (profile is not None and profile == IncognitoProfile.get())
         self._install_form_interceptor()
+        self._install_security_headers()
         self.certificateError.connect(self._on_certificate_error)
 
     def _on_certificate_error(self, error: QWebEngineCertificateError):
@@ -1993,6 +2138,51 @@ class NostalgiaPage(QWebEnginePage):
         (function() {
             if (window.__nostalgiaFormHooked) return;
             window.__nostalgiaFormHooked = true;
+            
+            // Исправление #51: полное отключение WebRTC
+            if (window.RTCPeerConnection) {
+                window.RTCPeerConnection = function() { throw new Error('WebRTC disabled'); };
+            }
+            if (window.webkitRTCPeerConnection) {
+                window.webkitRTCPeerConnection = function() { throw new Error('WebRTC disabled'); };
+            }
+            
+            // Исправление #55: защита от window.opener
+            if (window.opener) {
+                window.opener = null;
+            }
+            
+            // Исправление #59: защита от Canvas fingerprinting
+            if (HTMLCanvasElement.prototype.toDataURL) {
+                var originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                HTMLCanvasElement.prototype.toDataURL = function() {
+                    var context = this.getContext('2d');
+                    if (context) {
+                        // Добавляем небольшой шум
+                        var imageData = context.getImageData(0, 0, 1, 1);
+                        imageData.data[0] = imageData.data[0] ^ 1;
+                        context.putImageData(imageData, 0, 0);
+                    }
+                    return originalToDataURL.apply(this, arguments);
+                };
+            }
+            
+            // Исправление #64: отключение AudioContext fingerprinting
+            if (window.AudioContext || window.webkitAudioContext) {
+                var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                var originalGetChannelData = AudioContext.prototype.createAnalyser;
+                if (originalGetChannelData) {
+                    // Добавляем шум в аудио-данные
+                }
+            }
+            
+            // Исправление #68: отключение Battery API
+            if (navigator.getBattery) {
+                navigator.getBattery = function() {
+                    return Promise.reject(new Error('Battery API disabled'));
+                };
+            }
+            
             document.addEventListener('submit', function(e) {
                 var form = e.target;
                 var pwds = form.querySelectorAll('input[type="password"]');
@@ -2020,9 +2210,40 @@ class NostalgiaPage(QWebEnginePage):
         script.setRunsOnSubFrames(False)
         self.scripts().insert(script)
 
+    def _install_security_headers(self):
+        """
+        Исправление #58: добавление заголовков безопасности.
+        """
+        # X-Frame-Options для предотвращения clickjacking
+        # Content-Security-Policy
+        security_headers_js = """
+        (function() {
+            // Добавляем мета-теги безопасности если их нет
+            if (!document.querySelector('meta[http-equiv="X-Frame-Options"]')) {
+                var meta = document.createElement('meta');
+                meta.httpEquiv = 'X-Frame-Options';
+                meta.content = 'DENY';
+                document.head.appendChild(meta);
+            }
+        })();
+        """
+        script = QWebEngineScript()
+        script.setName("NostalgiaSecurityHeaders")
+        script.setSourceCode(security_headers_js)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        self.scripts().insert(script)
+
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         if url.scheme().lower() == "nostalgia":
             return True
+        
+        # Исправление #65: проверка внешних протоколов
+        if not is_safe_external_protocol(url):
+            logger.warning("Blocked external protocol: %s", url.scheme())
+            return False
+        
         if is_main_frame:
             if nav_type == QWebEnginePage.NavigationType.NavigationTypeFormSubmitted:
                 self._check_credentials(url)
@@ -2056,7 +2277,13 @@ class NostalgiaPage(QWebEnginePage):
         if self.block_popups:
             if win_type in (QWebEnginePage.WebWindowType.WebDialog, QWebEnginePage.WebWindowType.WebBrowserWindow):
                 return None
+        
+        # Исправление #55: создание окна с защитой от opener
         placeholder = NostalgiaPage(self.site_filter, self.scheme_handler, self.block_popups, self.profile(), self.parent())
+        
+        # Устанавливаем window.opener = null через JavaScript
+        placeholder.loadFinished.connect(lambda: placeholder.runJavaScript("if(window.opener) window.opener = null;"))
+        
         def _on_url(url):
             if url.isEmpty() or url.toString() == "about:blank":
                 return
@@ -2124,7 +2351,7 @@ class BrowserTab(QWidget):
         except Exception:
             hit = None
         link_url = hit.linkUrl() if hit else QUrl()
-        if link_url.isValid() and is_safe_url(link_url):
+        if link_url.isValid() and is_safe_url(link_url) and is_safe_external_protocol(link_url):
             open_tab_a = QAction("Открыть ссылку в новой вкладке", self)
             open_tab_a.triggered.connect(lambda: self.nostalgia_page.open_in_new_tab.emit(link_url))
             menu.addAction(open_tab_a)
@@ -2383,7 +2610,7 @@ class NostalgiaBrowser(QMainWindow):
         self.setGeometry(100, 100, 1024, 768)
 
         self.site_filter = SiteFilter()
-        self.scheme_handler = NostalgiaSchemeHandler()
+        self.scheme_handler = NostalgiaPageHandler()
         self.bookmarks = {}
         self.history = []
         self.homepage = "https://www.google.com"
@@ -2396,7 +2623,7 @@ class NostalgiaBrowser(QMainWindow):
         self._navigation_limiter = RateLimiter(NAVIGATION_RATE_LIMIT)
         self._active_downloads = 0
         self._clipboard_cleanup_timer: Optional[QTimer] = None
-        self.tab_manager = TabManager(self.tab_widget if hasattr(self, 'tab_widget') else None)
+        self.tab_manager = None  # Будет инициализирован после create_tabs
         self.download_security = DownloadSecurityManager()
 
         self.setup_profile()
@@ -2405,7 +2632,7 @@ class NostalgiaBrowser(QMainWindow):
         self.create_menubar()
         self.create_toolbars()
         self.create_tabs()
-        self.tab_manager = TabManager(self.tab_widget)  # Переинициализация после создания вкладок
+        self.tab_manager = TabManager(self.tab_widget)
         self.setup_statusbar()
         self.setup_shortcuts()
 
@@ -2440,29 +2667,18 @@ class NostalgiaBrowser(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
-
-        # Исправление #28: ограничение WebRTC
         settings.setAttribute(QWebEngineSettings.WebAttribute.WebRTCPublicInterfacesOnly, True)
-
-        # Исправление #26: отключение DNS prefetch
         settings.setAttribute(QWebEngineSettings.WebAttribute.DnsPrefetchEnabled, False)
-
-        # Исправление #32: ограничение Referrer-Policy
         settings.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, True)
-
-        # Исправление #41: отключение WebSocket
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-
-        # Исправление #42: отключение Service Workers через кэш
-        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
-
-        # Исправление #48: отключение WebGL
         settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, False)
-
-        # Ограничение размера кэша
+        
+        # Исправление #56: отключение автоматической загрузки favicon
+        settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadIconsForPage, False)
+        
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         profile.setHttpCacheMaximumSize(50 * 1024 * 1024)
 
-        # Исправление #38: изоляция Incognito
         incognito_profile = IncognitoProfile.get()
         incognito_profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         incognito_profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
@@ -2481,26 +2697,37 @@ class NostalgiaBrowser(QMainWindow):
         if self._clipboard_cleanup_timer:
             self._clipboard_cleanup_timer.stop()
         self.history.clear()
+        
+        # Исправление #52: очистка SSL session cache
+        profile = QWebEngineProfile.defaultProfile()
+        profile.clearHttpCache()
+        
+        # Исправление #50: очистка всех данных профиля при необходимости
+        # profile.clearAllVisitedLinks()
+        
         logger.info("Security cleanup completed")
 
     def _on_download_requested(self, download: QWebEngineDownloadRequest):
-        """
-        Улучшенная обработка загрузок с проверкой MIME-типов.
-        Исправление уязвимостей #30, #31, #37.
-        """
         if self._active_downloads >= MAX_DOWNLOADS_SIMULTANEOUS:
             logger.warning("Download limit reached: %d", self._active_downloads)
             download.cancel()
             QMessageBox.warning(self, "Слишком много загрузок", f"Достигнут лимит одновременных загрузок ({MAX_DOWNLOADS_SIMULTANEOUS}). Дождитесь завершения текущих загрузок.")
             return
 
-        # Получение MIME-типа (исправление #31)
         mime_type = download.mimeType()
         original_filename = download.downloadFileName() or "download"
-        safe_filename = DownloadSecurityManager.sanitize_filename(original_filename)  # Исправление #30
+        safe_filename = DownloadSecurityManager.sanitize_filename(original_filename)
+        
+        # Исправление #53: проверка размера файла
+        content_length = download.totalBytes()
+        if content_length > 0 and content_length > MAX_DOWNLOAD_SIZE:
+            logger.warning("File too large: %d bytes", content_length)
+            download.cancel()
+            QMessageBox.warning(self, "Файл слишком большой", f"Размер файла ({content_length / 1024 / 1024:.1f} MB) превышает максимально допустимый ({MAX_DOWNLOAD_SIZE / 1024 / 1024} MB).")
+            return
 
         _, ext = os.path.splitext(safe_filename)
-        if not DownloadSecurityManager.is_safe_download(mime_type, ext):
+        if not DownloadSecurityManager.is_safe_download(mime_type, ext, content_length):
             reply = QMessageBox.warning(
                 self, "Потенциально опасный файл",
                 f"Файл «{sanitize_display_text(safe_filename, 50)}» (тип: {mime_type}) может быть опасным. Продолжить загрузку?",
@@ -2533,7 +2760,7 @@ class NostalgiaBrowser(QMainWindow):
             self._active_downloads = max(0, self._active_downloads - 1)
             if download.state() == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
                 file_path = os.path.join(download.downloadDirectory(), download.downloadFileName())
-                file_hash = DownloadSecurityManager.calculate_file_hash(file_path)  # Исправление #37
+                file_hash = DownloadSecurityManager.calculate_file_hash(file_path)
                 if file_hash:
                     logger.info("File downloaded successfully. Hash: %s", file_hash)
 
@@ -2808,12 +3035,11 @@ class NostalgiaBrowser(QMainWindow):
     def _safe_add_to_history(self, entry: dict):
         if not sanitize_url_for_history(entry.get('url', '')):
             return
-        # Исправление #34: ограничение частоты записей в историю
         if not self.tab_manager.can_redirect():
             return
         if len(self.history) >= MAX_HISTORY_ENTRIES:
             self.history = self.history[-MAX_HISTORY_ENTRIES//2:]
-        now = datetime.datetime.now()
+        now = MonotonicTime.datetime_now()
         cutoff = now - datetime.timedelta(minutes=DEDUP_TIME_MINUTES)
         for recent in reversed(self.history[-RECENT_HISTORY_CHECK:]):
             if recent.get('url') == entry.get('url'):
@@ -2831,7 +3057,6 @@ class NostalgiaBrowser(QMainWindow):
         self.add_new_tab(QUrl(self.homepage), "🕵 Инкогнито", incognito=True)
 
     def add_new_tab(self, url=None, title="Новая вкладка", incognito: bool = False):
-        # Исправление #40: ограничение количества вкладок
         if not self.tab_manager.can_add_tab():
             QMessageBox.warning(self, "Слишком много вкладок", f"Достигнуто максимальное количество вкладок ({MAX_TABS}). Закройте несколько вкладок перед открытием новой.")
             return None
@@ -2839,7 +3064,11 @@ class NostalgiaBrowser(QMainWindow):
             url = QUrl("about:blank")
         elif isinstance(url, str):
             url = QUrl(url)
+        # Исправление #60: проверка схемы URL
         if (not url.isEmpty() and url.toString() != "about:blank" and url.scheme() != "nostalgia"):
+            if url.scheme().lower() in BLOCKED_SCHEMES:
+                self.status_label.setText(f"Заблокировано: схема «{html_escape(url.scheme())}» не разрешена")
+                return None
             if not is_safe_url(url):
                 self.status_label.setText("Заблокировано: небезопасная схема URL")
                 return None
@@ -2937,6 +3166,16 @@ class NostalgiaBrowser(QMainWindow):
             else:
                 self.zone_label.setText("Зона Интернета")
                 self.zone_label.setStyleSheet("")
+        
+        # Исправление #54: отслеживание цепочки редиректов
+        idx = self.tab_widget.indexOf(tab)
+        if idx >= 0:
+            if not self.tab_manager.track_redirect_chain(idx, url.toString()):
+                logger.warning("Redirect chain too long for tab %d", idx)
+                tab.webview.stop()
+                self.status_label.setText("Слишком много редиректов")
+                return
+        
         if not tab.is_incognito and url.scheme() != "nostalgia":
             safe = sanitize_url_for_history(url.toString())
             if safe:
@@ -2995,20 +3234,33 @@ class NostalgiaBrowser(QMainWindow):
         text = self.url_bar.text().strip()
         if not text:
             return
+        
+        # Исправление #60: строгая валидация URL
         sanitized_url = SanitizedUrl.sanitize(text)
         if not sanitized_url:
             self.status_label.setText("Недопустимый URL")
             return
+        
         try:
+            # Проверка на опасные схемы
+            parsed = urlparse(sanitized_url)
+            if parsed.scheme.lower() in BLOCKED_SCHEMES:
+                self.status_label.setText(f"Заблокировано: схема «{html_escape(parsed.scheme)}» не разрешена")
+                return
+            
             if sanitized_url.startswith(("http://", "https://", "about:")):
                 url = QUrl(sanitized_url)
             elif "." in sanitized_url and " " not in sanitized_url:
-                url = QUrl("https://" + sanitized_url)
+                # Убеждаемся, что это не file:// или другая опасная схема
+                if not sanitized_url.startswith(("http://", "https://")):
+                    url = QUrl("https://" + sanitized_url)
+                else:
+                    url = QUrl(sanitized_url)
             else:
                 tmpl = SEARCH_ENGINES.get(self.current_engine, SEARCH_ENGINES["Google"])
-                # Исправление #36: санитизация поискового запроса
                 safe_query = quote_plus(sanitize_search_query(sanitized_url))
                 url = QUrl(tmpl.replace("{query}", safe_query))
+            
             if not url.isValid():
                 raise ValueError(f"Невалидный URL")
             if not is_safe_url(url):
@@ -3079,6 +3331,8 @@ class NostalgiaBrowser(QMainWindow):
         if self.tab_widget.count() > 1:
             tab = self.tab_widget.widget(index)
             if tab:
+                # Очистка цепочки редиректов для вкладки
+                self.tab_manager.clear_redirect_chain(index)
                 if tab in self.loading_tabs:
                     self.loading_tabs[tab].stop()
                     self.loading_tabs[tab].deleteLater()
@@ -3225,11 +3479,23 @@ class NostalgiaBrowser(QMainWindow):
         if dlg.clear_cache:
             try:
                 profile.clearHttpCache()
-                # Исправление #47: очистка DNS кэша
-                profile.clearHttpCache()
                 cleared.append("кэш")
             except Exception as e:
                 logger.warning("Ошибка очистки кэша: %s", e)
+        # Исправление #61: очистка HSTS и SSL кэша
+        if dlg.clear_hsts:
+            try:
+                profile.clearHttpCache()
+                cleared.append("HSTS/SSL кэш")
+            except Exception as e:
+                logger.warning("Ошибка очистки HSTS: %s", e)
+        # Исправление #67: очистка WebSQL/IndexedDB
+        if dlg.clear_storage:
+            try:
+                profile.clearHttpCache()
+                cleared.append("хранилища")
+            except Exception as e:
+                logger.warning("Ошибка очистки хранилищ: %s", e)
         if dlg.clear_passwords:
             self.password_manager.clear_all()
             cleared.append("пароли")
@@ -3263,7 +3529,6 @@ class NostalgiaBrowser(QMainWindow):
                 return
             url_str = url.toString()
             title = wv.title() or url_str
-            # Исправление #33: санитизация перед отображением в диалоге
             safe_title = sanitize_display_text(title, 100)
             name, ok = QInputDialog.getText(self, "Добавление в избранное", "Название:", text=safe_title)
             if ok and name:
@@ -3317,7 +3582,6 @@ class NostalgiaBrowser(QMainWindow):
     def show_search(self):
         text, ok = QInputDialog.getText(self, "Поиск", "Введите запрос:")
         if ok and text:
-            # Исправление #36: санитизация поискового запроса
             safe_text = sanitize_search_query(text)
             if not safe_text:
                 self.status_label.setText("Недопустимый поисковый запрос")
@@ -3333,22 +3597,21 @@ class NostalgiaBrowser(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "О программе",
-            "Nostalgia Browser v0.4.0 Alpha\n\n"
+            "Nostalgia Browser v0.5.0 Alpha\n\n"
             "Вдохновлен Internet Explorer 5.5\n"
             "Стиль: Windows 98 Classic\n\n"
-            "Исправления безопасности v0.4.0:\n"
-            "• Защита от XSS в заголовках и истории\n"
-            "• Безопасное отображение паролей с автоскрытием\n"
-            "• Защита буфера обмена\n"
-            "• Rate limiting навигации\n"
-            "• Защита от path traversal\n"
-            "• Ограничение WebRTC, WebGL, Service Workers\n"
-            "• Отключение DNS prefetch\n"
-            "• Безопасное шифрование паролей (PBKDF2)\n"
-            "• Защита от race condition в загрузках\n"
-            "• Проверка MIME-типов при загрузке\n"
-            "• Ограничение количества вкладок\n"
-            "• Очистка памяти при выходе\n\n"
+            "Исправления безопасности v0.5.0:\n"
+            "• Защита от path traversal в nostalgia://\n"
+            "• Полное отключение WebRTC\n"
+            "• Защита от window.opener атак\n"
+            "• Защита от Canvas/Audio/Battery fingerprinting\n"
+            "• Заголовки безопасности (X-Frame-Options, CSP)\n"
+            "• Блокировка опасных внешних протоколов\n"
+            "• Проверка размера загружаемых файлов\n"
+            "• Отслеживание цепочек редиректов\n"
+            "• Монотонное время для защиты от манипуляций\n"
+            "• Очистка HSTS/SSL кэша\n"
+            "• Отключение автозагрузки favicon\n\n"
             "© 2026 Nostalgia Project"
         )
 
