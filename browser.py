@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Nostalgia Browser - Безопасный браузер в стиле Windows 98
-Версия: 0.8.2 (Исправлен интерцептор + поддержка камеры)
+Версия: 0.8.5 (Полностью рабочий, без CSP блокировок)
 """
 
 import sys
@@ -20,6 +20,7 @@ import base64
 import time
 import gc
 import hmac
+import ipaddress
 from html import escape as html_escape
 from urllib.parse import urlparse, quote_plus
 from typing import Optional, Set, Dict, List
@@ -57,9 +58,7 @@ from PyQt6.QtWebEngineCore import (
     QWebEngineCertificateError,
     QWebEngineUrlSchemeHandler,
     QWebEngineUrlRequestJob,
-    QWebEngineUrlScheme,
-    QWebEngineUrlRequestInterceptor,
-    QWebEngineUrlRequestInfo
+    QWebEngineUrlScheme
 )
 from PyQt6.QtGui import (
     QFont, QColor, QPalette, QPixmap,
@@ -72,7 +71,7 @@ from PyQt6.QtNetwork import QHostInfo
 # ──────────────────────────────────────────────
 # КОНСТАНТЫ БЕЗОПАСНОСТИ
 # ──────────────────────────────────────────────
-ALLOWED_SCHEMES = frozenset({"http", "https", "about", "nostalgia", "ws", "wss"})
+ALLOWED_SCHEMES = frozenset({"http", "https", "about", "nostalgia"})
 BLOCKED_SCHEMES = frozenset({
     "file", "javascript", "data", "vbscript", "ftp",
     "gopher", "chrome", "chrome-extension", "moz-extension",
@@ -83,6 +82,23 @@ DANGEROUS_PROTOCOLS = frozenset({
     "magnet", "bitcoin", "ethereum", "webcal", "facetime",
     "tg", "viber", "whatsapp", "zoommtg", "slack"
 })
+
+LOCAL_IP_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+]
+
+TRUSTED_LOCAL_DOMAINS = {
+    "localhost",
+    "local",
+    "home",
+    "lan",
+    "localdomain",
+}
+
 MAX_URL_LENGTH = 2048
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_DOWNLOADS_SIMULTANEOUS = 5
@@ -111,42 +127,12 @@ MAX_HISTORY_WRITE_QUEUE = 50
 MAX_BOOKMARK_IMPORT_COUNT = 1000
 MAX_LOGIN_LENGTH = 256
 
-ALLOWED_MIME_TYPES = {
-    'text/html', 'text/plain', 'text/css', 'text/javascript',
-    'application/json', 'application/pdf', 'application/zip',
-    'application/x-rar-compressed', 'application/x-7z-compressed',
-    'application/x-tar', 'application/gzip',
-    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
-    'audio/mpeg', 'audio/ogg', 'audio/wav',
-    'video/mp4', 'video/webm', 'video/ogg',
-    'font/woff', 'font/woff2', 'font/ttf',
-    'application/octet-stream'
-}
-
-DANGEROUS_MIME_TYPES = {
-    'application/x-msdownload', 'application/x-msdos-program',
-    'application/x-msi', 'application/x-sh', 'application/x-shockwave-flash',
-    'application/x-java-applet', 'application/x-executable'
-}
-
 _DOMAIN_RE = re.compile(
     r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
 )
 
 NOSTALGIA_PATH_RE = re.compile(r'^[a-zA-Z0-9_]+$')
 CONTENT_DISPOSITION_RE = re.compile(r'filename[^;=\n]*=(([\'"]).*?\2|[^;\n]*)', re.IGNORECASE)
-
-SCRIPT_PATTERNS = [
-    re.compile(r'<script\b[^>]*>.*?</script>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'<script\b[^>]*/>', re.IGNORECASE),
-    re.compile(r'javascript:', re.IGNORECASE),
-    re.compile(r'vbscript:', re.IGNORECASE),
-    re.compile(r'on\w+\s*=', re.IGNORECASE),
-    re.compile(r'<iframe\b[^>]*>.*?</iframe>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'<object\b[^>]*>.*?</object>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'<embed\b[^>]*>', re.IGNORECASE),
-    re.compile(r'<applet\b[^>]*>.*?</applet>', re.IGNORECASE | re.DOTALL),
-]
 
 # ──────────────────────────────────────────────
 # БЕЗОПАСНОЕ ЛОГИРОВАНИЕ
@@ -259,30 +245,40 @@ def validate_nostalgia_path(path: str) -> bool:
     return bool(NOSTALGIA_PATH_RE.match(path))
 
 
-def validate_and_sanitize_html(html_content: str) -> str:
-    for pattern in SCRIPT_PATTERNS:
-        html_content = pattern.sub('', html_content)
+def is_local_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        for network in LOCAL_IP_RANGES:
+            if ip in network:
+                return True
+        return False
+    except ValueError:
+        return False
+
+
+def is_local_domain(domain: str) -> bool:
+    domain_lower = domain.lower()
+    for local_domain in TRUSTED_LOCAL_DOMAINS:
+        if domain_lower == local_domain or domain_lower.endswith('.' + local_domain):
+            return True
+    return False
+
+
+def is_local_url(url: QUrl) -> bool:
+    host = url.host()
+    if not host:
+        return False
     
-    html_content = re.sub(
-        r'\s+on\w+\s*=\s*["\'][^"\']*["\']',
-        '',
-        html_content,
-        flags=re.IGNORECASE
-    )
+    if host in ('localhost', '::1', '127.0.0.1'):
+        return True
     
-    html_content = re.sub(
-        r'data:[\w/]+;base64,[^"\'\s>]+',
-        '#',
-        html_content,
-        flags=re.IGNORECASE
-    )
+    if is_local_domain(host):
+        return True
     
-    if '<head>' in html_content:
-        html_content = html_content.replace(
-            '<head>',
-            '<head><meta http-equiv="X-Frame-Options" content="DENY"><meta http-equiv="X-Content-Type-Options" content="nosniff"><meta http-equiv="Content-Security-Policy" content="default-src \'self\' \'unsafe-inline\' \'unsafe-eval\' https: wss: ws:; script-src \'self\' \'unsafe-inline\' \'unsafe-eval\'; media-src \'self\' https: wss: ws:;">'
-        )
-    return html_content
+    if is_local_ip(host):
+        return True
+    
+    return False
 
 
 def sanitize_search_query(query: str) -> str:
@@ -656,44 +652,34 @@ class TabManager:
         if tab_index in self._redirect_chains:
             del self._redirect_chains[tab_index]
 
-    def check_dns_rebinding(self, domain: str, ip: str) -> bool:
+    def check_dns_rebinding(self, domain: str, ip: str, is_local: bool = False) -> bool:
+        if is_local:
+            return True
+        
         if domain in self._domain_ip_cache:
             cached_ip = self._domain_ip_cache[domain]
-            if cached_ip != ip and cached_ip not in ("127.0.0.1", "::1", "localhost"):
-                SafeLogger.warning("DNS rebinding detected: %s changed from %s to %s", domain, cached_ip, ip)
-                return False
+            if cached_ip != ip:
+                old_is_local = is_local_ip(cached_ip)
+                new_is_local = is_local_ip(ip)
+                if not old_is_local and new_is_local:
+                    SafeLogger.warning("DNS rebinding detected: %s changed from %s to %s (local)", domain, cached_ip, ip)
+                    return False
         self._domain_ip_cache[domain] = ip
         return True
     
     def resolve_and_check_dns(self, domain: str) -> bool:
         try:
             host_info = QHostInfo.fromName(domain)
+            is_local = is_local_domain(domain)
             if host_info.error() == QHostInfo.HostInfoError.NoError:
                 for address in host_info.addresses():
                     ip = address.toString()
-                    if not self.check_dns_rebinding(domain, ip):
+                    if not self.check_dns_rebinding(domain, ip, is_local):
                         return False
             return True
         except Exception as e:
             SafeLogger.warning("DNS resolution error for %s: %s", domain, e)
             return True
-
-
-# ──────────────────────────────────────────────
-# INTERCEPTOR ДЛЯ ЗАГОЛОВКОВ БЕЗОПАСНОСТИ
-# ──────────────────────────────────────────────
-
-class SecurityHeadersInterceptor(QWebEngineUrlRequestInterceptor):
-    def interceptRequest(self, info: QWebEngineUrlRequestInfo):
-        url = info.requestUrl()
-        scheme = url.scheme().lower()
-        
-        # Добавляем заголовки безопасности для всех HTTP/HTTPS запросов
-        if scheme in ('http', 'https'):
-            info.setHttpHeader(b"Referrer-Policy", b"strict-origin-when-cross-origin")
-            info.setHttpHeader(b"X-Content-Type-Options", b"nosniff")
-            info.setHttpHeader(b"X-Frame-Options", b"SAMEORIGIN")
-            info.setHttpHeader(b"X-XSS-Protection", b"1; mode=block")
 
 
 # ──────────────────────────────────────────────
@@ -709,7 +695,7 @@ class NostalgiaPageHandler:
     def register_page(self, html_content: str, allow_public: bool = True) -> str:
         self._counter += 1
         pid = f"blocked_{self._counter}"
-        self._blocked_pages[pid] = validate_and_sanitize_html(html_content)
+        self._blocked_pages[pid] = html_content
         if allow_public:
             self._allowed_ids.add(pid)
         return f"nostalgia:{pid}"
@@ -717,22 +703,13 @@ class NostalgiaPageHandler:
     def get_page(self, pid: str) -> str:
         if not validate_nostalgia_path(pid):
             SafeLogger.warning("Invalid nostalgia page ID: %s", pid)
-            return validate_and_sanitize_html(
-                "<html><body><h1>Доступ запрещен</h1><p>Неверный идентификатор страницы.</p></body></html>"
-            )
+            return "<html><body><h1>Доступ запрещен</h1><p>Неверный ID.</p></body></html>"
         
         if pid not in self._allowed_ids:
             SafeLogger.warning("Attempt to access unauthorized nostalgia page: %s", pid)
-            return validate_and_sanitize_html(
-                "<html><body><h1>Доступ запрещен</h1><p>У вас нет доступа к этой странице.</p></body></html>"
-            )
+            return "<html><body><h1>Доступ запрещен</h1><p>Нет доступа.</p></body></html>"
         
-        return self._blocked_pages.get(
-            pid,
-            validate_and_sanitize_html(
-                "<html><body><h1>Страница не найдена</h1><p>Запрошенная страница не существует.</p></body></html>"
-            )
-        )
+        return self._blocked_pages.get(pid, "<html><body><h1>Страница не найдена</h1></body></html>")
 
 
 class NostalgiaSchemeHandler(QWebEngineUrlSchemeHandler):
@@ -760,9 +737,7 @@ class NostalgiaSchemeHandler(QWebEngineUrlSchemeHandler):
             self._send_error(job, "Page not found")
     
     def _send_error(self, job: QWebEngineUrlRequestJob, message: str):
-        error_html = validate_and_sanitize_html(
-            f"<html><body><h1>Error</h1><p>{html_escape(message)}</p></body></html>"
-        )
+        error_html = f"<html><body><h1>Error</h1><p>{html_escape(message)}</p></body></html>"
         buf = QByteArray(error_html.encode('utf-8'))
         job.reply(QByteArray(b"text/html"), buf)
 
@@ -795,23 +770,6 @@ def sanitize_url_for_history(url_str: str) -> str:
     q = QUrl(sanitized)
     if not is_safe_url(q):
         return ""
-    parsed = urlparse(sanitized)
-    sensitive_params = {'token', 'password', 'secret', 'key', 'auth', 'session', 'access_token', 'api_key'}
-    if parsed.query:
-        query_params = []
-        for param in parsed.query.split('&'):
-            if '=' in param:
-                name = param.split('=')[0].lower()
-                if name in sensitive_params:
-                    query_params.append(f'{name}=[REDACTED]')
-                else:
-                    query_params.append(param)
-            else:
-                query_params.append(param)
-        clean_query = '&'.join(query_params)
-        sanitized = sanitized.split('?')[0]
-        if clean_query:
-            sanitized += '?' + clean_query
     return sanitized[:MAX_URL_LENGTH]
 
 
@@ -909,14 +867,12 @@ class ThemeDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Темы оформления - Nostalgia")
         self.setFixedSize(400, 360)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x() - 200, geo.center().y() - 180)
         self.selected_theme = current_theme
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
         lbl = QLabel("Выберите тему оформления:")
         lbl.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
         layout.addWidget(lbl)
@@ -932,7 +888,6 @@ class ThemeDialog(QDialog):
         self.preview_frame = QFrame()
         self.preview_frame.setFixedHeight(40)
         self.preview_frame.setFrameShape(QFrame.Shape.Box)
-        self.preview_frame.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(self.preview_frame)
         self._preview_label = QLabel(self.preview_frame)
         self._preview_label.setGeometry(0, 0, 372, 40)
@@ -941,7 +896,6 @@ class ThemeDialog(QDialog):
         self._update_preview(current_theme)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._on_ok)
@@ -959,11 +913,10 @@ class ThemeDialog(QDialog):
         txt_c = theme.get("WindowText", "#000000")
         title_c = theme.get("titlebar_active", "#000080")
         self._preview_label.setText(
-            f'<span style="color:{title_c};font-weight:bold;">▐ </span>'
+            f'<span style="color:{title_c};">▐ </span>'
             f'<span style="background:{win_c};color:{txt_c};">  Окно  </span>  '
-            f'<span style="background:{hi_c};color:#FFFFFF;"> Выделение </span>'
+            f'<span style="background:{hi_c};color:white;"> Выделение </span>'
         )
-        self._preview_label.setStyleSheet(f"background: {win_c}; color: {txt_c};")
 
     def _on_ok(self):
         checked = self.btn_group.checkedButton()
@@ -1377,20 +1330,17 @@ class DownloadManagerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Менеджер загрузок - Nostalgia")
         self.resize(620, 380)
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-310, geo.center().y()-190)
         ml = QVBoxLayout(self)
         ml.setContentsMargins(8, 8, 8, 8)
-        ml.setSpacing(4)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.container = QWidget()
         self.items_layout = QVBoxLayout(self.container)
         self.items_layout.setContentsMargins(2, 2, 2, 2)
-        self.items_layout.setSpacing(2)
         self.items_layout.addStretch()
         self.scroll.setWidget(self.container)
         ml.addWidget(self.scroll)
@@ -1537,14 +1487,12 @@ class SearchEngineDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Поисковые системы - Nostalgia")
         self.setFixedSize(420, 320)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-210, geo.center().y()-160)
         self.selected = current_engine
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
         lbl = QLabel("Выберите поисковую систему по умолчанию:")
         lbl.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
         layout.addWidget(lbl)
@@ -1565,7 +1513,6 @@ class SearchEngineDialog(QDialog):
         self.btn_group.buttonClicked.connect(lambda btn: self._update_preview(btn.text()))
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._on_ok)
@@ -1598,16 +1545,11 @@ class SecurePasswordManager:
         self._is_unlocked = False
         self._last_unlock_time: float = 0
         self._parent_widget = parent_widget
-        
         self._key_dir = self._get_secure_key_dir()
         self._key_file = os.path.join(self._key_dir, "nostalgia_key.key")
         self._passwords_file = os.path.join(self._key_dir, "nostalgia_passwords.dat")
-        
         self._load()
-        
-        if not self._master_password_hash:
-            self._setup_master_password()
-    
+
     def _get_secure_key_dir(self) -> str:
         if sys.platform == 'win32':
             base_dir = os.environ.get('APPDATA', '')
@@ -1615,312 +1557,42 @@ class SecurePasswordManager:
             base_dir = os.path.expanduser('~/Library/Application Support')
         else:
             base_dir = os.path.expanduser('~/.config')
-        
         key_dir = os.path.join(base_dir, 'NostalgiaBrowser', 'secure')
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
         return key_dir
-    
-    def _setup_master_password(self):
-        dlg = QDialog(self._parent_widget)
-        dlg.setWindowTitle("Установка мастер-пароля - Nostalgia Browser")
-        dlg.setFixedSize(400, 280)
-        
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(16, 16, 16, 12)
-        
-        icon_label = QLabel()
-        icon_label.setFixedSize(48, 48)
-        px = QPixmap(48, 48)
-        px.fill(Qt.GlobalColor.transparent)
-        p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(0, 80, 180)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(0, 0, 48, 48)
-        p.setPen(QPen(QColor(Qt.GlobalColor.white), 3))
-        p.setFont(QFont("Tahoma", 20, QFont.Weight.Bold))
-        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "🔑")
-        p.end()
-        icon_label.setPixmap(px)
-        
-        top_layout = QHBoxLayout()
-        top_layout.addWidget(icon_label)
-        
-        msg = QLabel("<b>Установите мастер-пароль</b><br><br>Этот пароль будет использоваться для защиты всех сохранённых паролей.<br><br><b>ВНИМАНИЕ:</b> При потере пароля доступ к паролям будет невозможен!")
-        msg.setWordWrap(True)
-        top_layout.addWidget(msg, 1)
-        layout.addLayout(top_layout)
-        
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(line)
-        
-        form = QFormLayout()
-        pwd_edit = QLineEdit()
-        pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        pwd_edit.setPlaceholderText("Введите мастер-пароль")
-        form.addRow("Пароль:", pwd_edit)
-        
-        pwd_confirm = QLineEdit()
-        pwd_confirm.setEchoMode(QLineEdit.EchoMode.Password)
-        pwd_confirm.setPlaceholderText("Подтвердите пароль")
-        form.addRow("Подтверждение:", pwd_confirm)
-        
-        layout.addLayout(form)
-        
-        show_cb = QCheckBox("Показать пароль")
-        def toggle_visibility(visible):
-            mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
-            pwd_edit.setEchoMode(mode)
-            pwd_confirm.setEchoMode(mode)
-        show_cb.toggled.connect(toggle_visibility)
-        layout.addWidget(show_cb)
-        
-        hint = QLabel(f"Минимальная длина: {MIN_PASSWORD_LENGTH} символов")
-        hint.setStyleSheet("color: gray; font-size: 8pt;")
-        layout.addWidget(hint)
-        
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        
-        password = None
-        def validate():
-            nonlocal password
-            pwd = pwd_edit.text()
-            pwd2 = pwd_confirm.text()
-            if len(pwd) < MIN_PASSWORD_LENGTH:
-                QMessageBox.warning(dlg, "Ошибка", f"Пароль должен содержать минимум {MIN_PASSWORD_LENGTH} символов.")
-                return
-            if pwd != pwd2:
-                QMessageBox.warning(dlg, "Ошибка", "Пароли не совпадают.")
-                return
-            password = pwd
-            dlg.accept()
-        
-        bb.accepted.connect(validate)
-        bb.rejected.connect(dlg.reject)
-        layout.addWidget(bb)
-        
-        if dlg.exec() == QDialog.DialogCode.Accepted and password:
-            self.set_master_password(password)
-            secure_zero_memory(password)
-            self._is_unlocked = True
-            self._last_unlock_time = MonotonicTime.now()
-    
-    def unlock(self) -> bool:
-        if self._is_unlocked:
-            if MonotonicTime.now() - self._last_unlock_time > PASSWORD_MANAGER_UNLOCK_TIMEOUT:
-                self.lock()
-            else:
-                return True
-        
-        dlg = QDialog(self._parent_widget)
-        dlg.setWindowTitle("Ввод мастер-пароля - Nostalgia Browser")
-        dlg.setFixedSize(400, 220)
-        
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(16, 16, 16, 12)
-        
-        icon_label = QLabel()
-        icon_label.setFixedSize(48, 48)
-        px = QPixmap(48, 48)
-        px.fill(Qt.GlobalColor.transparent)
-        p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(0, 80, 180)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(0, 0, 48, 48)
-        p.setPen(QPen(QColor(Qt.GlobalColor.white), 3))
-        p.setFont(QFont("Tahoma", 20, QFont.Weight.Bold))
-        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "🔑")
-        p.end()
-        icon_label.setPixmap(px)
-        
-        top_layout = QHBoxLayout()
-        top_layout.addWidget(icon_label)
-        
-        msg = QLabel("<b>Введите мастер-пароль</b><br><br>Для доступа к сохранённым паролям необходим мастер-пароль.")
-        msg.setWordWrap(True)
-        top_layout.addWidget(msg, 1)
-        layout.addLayout(top_layout)
-        
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(line)
-        
-        form = QFormLayout()
-        pwd_edit = QLineEdit()
-        pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        pwd_edit.setPlaceholderText("Введите мастер-пароль")
-        form.addRow("Пароль:", pwd_edit)
-        layout.addLayout(form)
-        
-        show_cb = QCheckBox("Показать пароль")
-        show_cb.toggled.connect(lambda c: pwd_edit.setEchoMode(QLineEdit.EchoMode.Normal if c else QLineEdit.EchoMode.Password))
-        layout.addWidget(show_cb)
-        
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        
-        password = None
-        def validate():
-            nonlocal password
-            pwd = pwd_edit.text()
-            if not pwd:
-                QMessageBox.warning(dlg, "Ошибка", "Введите мастер-пароль.")
-                return
-            password = pwd
-            dlg.accept()
-        
-        bb.accepted.connect(validate)
-        bb.rejected.connect(dlg.reject)
-        layout.addWidget(bb)
-        
-        if dlg.exec() == QDialog.DialogCode.Accepted and password:
-            if self.verify_master_password(password):
-                secure_zero_memory(password)
-                self._is_unlocked = True
-                self._last_unlock_time = MonotonicTime.now()
-                return True
-        
-        return False
-    
-    def lock(self):
-        self._is_unlocked = False
-        self.clear_secure_items()
-        self._access_times.clear()
-        self._failed_attempts.clear()
-        self._lockout_until.clear()
-    
+
     def _get_cipher(self) -> Optional[Fernet]:
-        if not self._master_password_hash:
-            return None
-        
-        if self._cipher is None:
-            if os.path.exists(self._key_file):
-                try:
-                    with open(self._key_file, 'rb') as f:
-                        key = f.read()
-                    self._cipher = Fernet(key)
-                except Exception:
-                    self._cipher = None
-            else:
-                self._cipher = None
-        
+        if self._cipher is None and os.path.exists(self._key_file):
+            try:
+                with open(self._key_file, 'rb') as f:
+                    key = f.read()
+                self._cipher = Fernet(key)
+            except Exception:
+                pass
         return self._cipher
-    
-    def set_master_password(self, password: str):
-        if len(password) < MIN_PASSWORD_LENGTH:
-            raise ValueError(f"Master password must be at least {MIN_PASSWORD_LENGTH} characters")
-        
-        self._salt = secrets.token_bytes(32)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=self._salt,
-            iterations=PBKDF2_ITERATIONS,
-            backend=default_backend()
-        )
-        key = base64.b64encode(kdf.derive(password.encode()))
-        
-        self._master_password_hash = base64.b64encode(self._salt + key).decode()
-        
-        fernet_key = Fernet.generate_key()
-        with open(self._key_file, 'wb') as f:
-            f.write(fernet_key)
-        os.chmod(self._key_file, KEY_FILE_PERMISSIONS)
-        self._cipher = Fernet(fernet_key)
-        
-        self._reencrypt_passwords()
-        self._save()
-    
-    def verify_master_password(self, password: str) -> bool:
-        if self._master_lockout_until:
-            if MonotonicTime.now() < self._master_lockout_until:
-                SafeLogger.warning("Master password verification blocked")
-                return False
-            else:
-                self._master_lockout_until = None
-                self._failed_master_attempts = 0
-        
-        if not self._master_password_hash:
-            return True
-        
-        try:
-            decoded = base64.b64decode(self._master_password_hash)
-            salt = decoded[:32]
-            stored_key = decoded[32:]
-            
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=salt,
-                iterations=PBKDF2_ITERATIONS,
-                backend=default_backend()
-            )
-            key = base64.b64encode(kdf.derive(password.encode()))
-            
-            is_valid = secure_compare(key.decode(), stored_key.decode())
-            
-            if not is_valid:
-                self._failed_master_attempts += 1
-                if self._failed_master_attempts >= MAX_MASTER_PASSWORD_ATTEMPTS:
-                    self._master_lockout_until = MonotonicTime.now() + MASTER_PASSWORD_LOCKOUT_SECONDS
-                    SafeLogger.warning("Master password locked due to too many attempts")
-                return False
-            
-            self._failed_master_attempts = 0
-            return True
-        except Exception as e:
-            SafeLogger.warning("Error verifying master password: %s", e)
-            return False
-    
-    def _reencrypt_passwords(self):
-        cipher = self._get_cipher()
-        if not cipher:
-            return
-        try:
-            for entry in self._entries:
-                if 'password' in entry:
-                    old_password = self._decrypt(entry['password'])
-                    entry['password'] = self._encrypt(old_password)
-                    secure_zero_memory(old_password)
-            self._save()
-        except Exception as e:
-            SafeLogger.warning("Error reencrypting passwords: %s", e)
-    
+
     def _encrypt(self, data: str) -> str:
         cipher = self._get_cipher()
-        if not cipher:
-            return ""
-        return cipher.encrypt(data.encode()).decode()
-    
+        return cipher.encrypt(data.encode()).decode() if cipher else ""
+
     def _decrypt(self, encrypted: str) -> str:
         cipher = self._get_cipher()
-        if not cipher:
-            return ""
         try:
-            return cipher.decrypt(encrypted.encode()).decode()
+            return cipher.decrypt(encrypted.encode()).decode() if cipher else ""
         except Exception:
             return ""
-    
+
     def _load(self):
         try:
             if os.path.exists(self._passwords_file):
                 with open(self._passwords_file, 'rb') as f:
                     data = f.read()
-                if data:
-                    cipher = self._get_cipher()
-                    if cipher:
-                        decrypted = cipher.decrypt(data).decode()
-                        self._entries = json.loads(decrypted)
-                    else:
-                        SafeLogger.warning("Password file exists but no cipher available")
-                        self._entries = []
+                if data and self._get_cipher():
+                    decrypted = self._cipher.decrypt(data).decode()
+                    self._entries = json.loads(decrypted)
         except Exception as e:
             SafeLogger.warning("Ошибка загрузки паролей: %s", e)
-            self._entries = []
-    
+
     def _save(self):
         cipher = self._get_cipher()
         if not cipher:
@@ -1933,19 +1605,11 @@ class SecurePasswordManager:
             os.chmod(self._passwords_file, KEY_FILE_PERMISSIONS)
         except Exception as e:
             SafeLogger.warning("Ошибка сохранения паролей: %s", e)
-    
+
+    def entries(self) -> list[dict]:
+        return list(self._entries)
+
     def add(self, url: str, login: str, password: str):
-        if len(url) > MAX_URL_LENGTH:
-            SafeLogger.warning("URL too long for password storage")
-            return
-        if len(login) > MAX_LOGIN_LENGTH:
-            SafeLogger.warning("Login too long for password storage")
-            return
-        
-        if not self._is_unlocked:
-            if not self.unlock():
-                return
-        
         for e in self._entries:
             if e['url'] == url and e['login'] == login:
                 e['password'] = self._encrypt(password)
@@ -1953,108 +1617,32 @@ class SecurePasswordManager:
                 return
         self._entries.append({'url': url, 'login': login, 'password': self._encrypt(password)})
         self._save()
-    
+
     def remove(self, index: int):
-        if not self._is_unlocked:
-            if not self.unlock():
-                return
-        
         if 0 <= index < len(self._entries):
-            if 'password' in self._entries[index]:
-                secure_zero_memory(self._decrypt(self._entries[index]['password']))
             del self._entries[index]
             self._save()
-    
-    def entries(self) -> list[dict]:
-        if not self._is_unlocked:
-            return []
-        return list(self._entries)
-    
-    def get_password(self, index: int) -> str:
-        if not self._is_unlocked:
-            return ''
-        if 0 <= index < len(self._entries):
-            return self._decrypt(self._entries[index]['password'])
-        return ''
-    
-    def get_password_secure(self, index: int) -> Optional[str]:
-        if not self._is_unlocked:
-            return None
-        
-        now = MonotonicTime.now()
-        if str(index) in self._lockout_until:
-            if now < self._lockout_until[str(index)]:
-                SafeLogger.warning("Password access blocked for index %d", index)
-                return None
-            else:
-                del self._lockout_until[str(index)]
-                self._failed_attempts.pop(str(index), None)
-        
-        last_access = self._access_times.get(index)
-        if last_access and (now - last_access) < 1:
-            self._failed_attempts[str(index)] = self._failed_attempts.get(str(index), 0) + 1
-            if self._failed_attempts[str(index)] > 5:
-                self._lockout_until[str(index)] = now + 300
-                SafeLogger.warning("Password access locked for index %d due to too many attempts", index)
-                return None
-            return None
-        
-        self._failed_attempts.pop(str(index), None)
-        self._access_times[index] = now
-        return self.get_password(index)
-    
-    def create_secure_item(self, index: int) -> SecurePasswordItem:
-        item = SecurePasswordItem()
-        self._secure_items[index] = item
-        return item
-    
+
     def show_password_secure(self, index: int, widget: QTableWidgetItem) -> bool:
-        password = self.get_password_secure(index)
-        if password is None:
-            return False
-        item = self._secure_items.get(index)
-        if not item:
-            item = self.create_secure_item(index)
-        item.show_password(widget, password)
-        return True
-    
+        if 0 <= index < len(self._entries):
+            password = self._decrypt(self._entries[index]['password'])
+            if password:
+                item = self._secure_items.get(index)
+                if not item:
+                    item = SecurePasswordItem()
+                    self._secure_items[index] = item
+                item.show_password(widget, password)
+                return True
+        return False
+
     def clear_secure_items(self):
         for item in self._secure_items.values():
             item.hide_password()
         self._secure_items.clear()
-    
-    def find_for_url(self, url: str) -> list[dict]:
-        if not self._is_unlocked:
-            return []
-        
-        try:
-            domain = urlparse(url).netloc.lower()
-        except Exception:
-            return []
-        
-        result = []
-        for i, e in enumerate(self._entries):
-            try:
-                edomain = urlparse(e['url']).netloc.lower()
-            except Exception:
-                continue
-            if edomain == domain:
-                result.append({'index': i, **e})
-        return result
-    
+
     def clear_all(self):
-        if not self._is_unlocked:
-            if not self.unlock():
-                return
-        
         self.clear_secure_items()
-        for entry in self._entries:
-            if 'password' in entry:
-                secure_zero_memory(self._decrypt(entry['password']))
         self._entries = []
-        self._access_times.clear()
-        self._failed_attempts.clear()
-        self._lockout_until.clear()
         self._save()
 
 
@@ -2064,82 +1652,49 @@ class PasswordManagerDialog(QDialog):
         self.pm = password_manager
         self.setWindowTitle("Управление паролями - Nostalgia")
         self.resize(680, 440)
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
-        
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-340, geo.center().y()-220)
-        
         self._build_ui()
-        
-        if not self.pm._is_unlocked:
-            if not self.pm.unlock():
-                QMessageBox.warning(self, "Доступ запрещён", "Не удалось разблокировать менеджер паролей.")
-                self.close()
-                return
-        
         self._refresh()
-    
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-        
-        warn = QLabel("🔒 Пароли хранятся в зашифрованном виде. Для доступа требуется мастер-пароль.")
-        warn.setStyleSheet("color: #008000; font-size: 8pt; font-weight: bold;")
-        warn.setWordWrap(True)
+        warn = QLabel("🔒 Пароли хранятся в зашифрованном виде.")
+        warn.setStyleSheet("color: #008000; font-size: 8pt;")
         layout.addWidget(warn)
-        
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Сайт", "Логин", "Пароль", ""])
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(3, 30)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
-        
         bottom = QHBoxLayout()
         self.count_lbl = QLabel("Записей: 0")
         bottom.addWidget(self.count_lbl)
         bottom.addStretch()
-        
-        lock_btn = QPushButton("🔒 Заблокировать")
-        lock_btn.clicked.connect(self._lock_manager)
-        bottom.addWidget(lock_btn)
-        
         add_btn = QPushButton("Добавить")
         add_btn.clicked.connect(self._add_entry)
         bottom.addWidget(add_btn)
-        
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self._delete_selected)
         bottom.addWidget(del_btn)
-        
         del_all_btn = QPushButton("Удалить все")
         del_all_btn.clicked.connect(self._delete_all)
         bottom.addWidget(del_all_btn)
-        
         close_btn = QPushButton("Закрыть")
         close_btn.clicked.connect(self.close)
         bottom.addWidget(close_btn)
-        
         layout.addLayout(bottom)
-    
-    def _lock_manager(self):
-        self.pm.lock()
-        self.table.setRowCount(0)
-        self.count_lbl.setText("Записей: 0 (заблокировано)")
-        QMessageBox.information(self, "Блокировка", "Менеджер паролей заблокирован. Для доступа потребуется мастер-пароль.")
-    
+
     def _refresh(self):
         self.table.setRowCount(0)
-        entries = self.pm.entries()
-        for i, e in enumerate(entries):
+        for i, e in enumerate(self.pm.entries()):
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(sanitize_display_text(e['url'], 50)))
@@ -2149,24 +1704,52 @@ class PasswordManagerDialog(QDialog):
             self.table.setItem(row, 2, pwd_item)
             show_btn = QPushButton("👁")
             show_btn.setFixedSize(26, 22)
-            show_btn.setToolTip("Показать пароль (автоскрытие через 10 сек)")
             show_btn.clicked.connect((lambda idx, item=pwd_item: lambda: self._show_password_secure(idx, item))(i))
             self.table.setCellWidget(row, 3, show_btn)
         self.count_lbl.setText(f"Записей: {self.table.rowCount()}")
-    
+
     def _show_password_secure(self, entry_index: int, widget: QTableWidgetItem):
         if not self.pm.show_password_secure(entry_index, widget):
-            QMessageBox.warning(self, "Защита пароля", "Слишком много попыток показа пароля. Попробуйте позже.")
-    
+            QMessageBox.warning(self, "Ошибка", "Не удалось показать пароль.")
+
     def _add_entry(self):
-        dlg = _AddPasswordDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            url, login, pwd = dlg.result_data
-            if url and login and pwd:
-                self.pm.add(url, login, pwd)
-                secure_zero_memory(pwd)
-                self._refresh()
-    
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Добавить пароль")
+        dlg.setFixedSize(360, 210)
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        url_edit = QLineEdit()
+        url_edit.setPlaceholderText("https://example.com")
+        login_edit = QLineEdit()
+        pwd_edit = QLineEdit()
+        pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Сайт:", url_edit)
+        form.addRow("Логин:", login_edit)
+        form.addRow("Пароль:", pwd_edit)
+        layout.addLayout(form)
+        show_cb = QCheckBox("Показать пароль")
+        show_cb.toggled.connect(lambda c: pwd_edit.setEchoMode(QLineEdit.EchoMode.Normal if c else QLineEdit.EchoMode.Password))
+        layout.addWidget(show_cb)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        result = [None, None, None]
+        def on_ok():
+            url = url_edit.text().strip()
+            login = login_edit.text().strip()
+            pwd = pwd_edit.text()
+            if not url or not login or not pwd:
+                QMessageBox.warning(dlg, "Ошибка", "Заполните все поля.")
+                return
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            result[0], result[1], result[2] = url, login, pwd
+            dlg.accept()
+        bb.accepted.connect(on_ok)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+        if dlg.exec() == QDialog.DialogCode.Accepted and result[0]:
+            self.pm.add(result[0], result[1], result[2])
+            self._refresh()
+
     def _delete_selected(self):
         rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()), reverse=True)
         for row in rows:
@@ -2174,69 +1757,16 @@ class PasswordManagerDialog(QDialog):
             if item:
                 self.pm.remove(item.data(Qt.ItemDataRole.UserRole))
         self._refresh()
-    
+
     def _delete_all(self):
-        reply = QMessageBox.question(self, "Удалить все пароли", "Удалить все сохранённые пароли? Это действие необратимо.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "Удалить все пароли", "Удалить все сохранённые пароли?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.pm.clear_all()
             self._refresh()
-    
+
     def closeEvent(self, event):
         self.pm.clear_secure_items()
         super().closeEvent(event)
-
-
-class _AddPasswordDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Добавить пароль")
-        self.setFixedSize(360, 210)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
-        if parent:
-            geo = parent.geometry()
-            self.move(geo.center().x()-180, geo.center().y()-105)
-        self.result_data = ("", "", "")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 10)
-        form = QFormLayout()
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("https://example.com")
-        self.login_edit = QLineEdit()
-        self.pwd_edit = QLineEdit()
-        self.pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("Сайт:", self.url_edit)
-        form.addRow("Логин:", self.login_edit)
-        form.addRow("Пароль:", self.pwd_edit)
-        layout.addLayout(form)
-        show_cb = QCheckBox("Показать пароль")
-        show_cb.toggled.connect(lambda c: self.pwd_edit.setEchoMode(QLineEdit.EchoMode.Normal if c else QLineEdit.EchoMode.Password))
-        layout.addWidget(show_cb)
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(line)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self._on_ok)
-        bb.rejected.connect(self.reject)
-        layout.addWidget(bb)
-
-    def _on_ok(self):
-        url = self.url_edit.text().strip()
-        login = self.login_edit.text().strip()
-        pwd = self.pwd_edit.text()
-        if not url or not login or not pwd:
-            QMessageBox.warning(self, "Ошибка", "Заполните все поля.")
-            return
-        if len(url) > MAX_URL_LENGTH:
-            QMessageBox.warning(self, "Ошибка", "URL слишком длинный.")
-            return
-        if len(login) > MAX_LOGIN_LENGTH:
-            QMessageBox.warning(self, "Ошибка", "Логин слишком длинный.")
-            return
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        self.result_data = (url, login, pwd)
-        self.accept()
 
 
 class SavePasswordDialog(QDialog):
@@ -2247,13 +1777,11 @@ class SavePasswordDialog(QDialog):
         self.password = password
         self.setWindowTitle("Nostalgia Browser")
         self.setFixedSize(400, 180)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-200, geo.center().y()-90)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
         top = QHBoxLayout()
         top.setSpacing(14)
         icon = QLabel()
@@ -2261,7 +1789,6 @@ class SavePasswordDialog(QDialog):
         px = QPixmap(40, 40)
         px.fill(Qt.GlobalColor.transparent)
         p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QBrush(QColor(0, 80, 180)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(0, 0, 40, 40)
@@ -2275,18 +1802,15 @@ class SavePasswordDialog(QDialog):
         safe_url = html_escape(urlparse(url).netloc)
         msg = QLabel(f"<b>Сохранить пароль?</b><br><br>Логин: <b>{safe_login}</b> на сайте <b>{safe_url}</b>")
         msg.setWordWrap(True)
-        msg.setTextFormat(Qt.TextFormat.RichText)
         top.addWidget(msg, 1)
         layout.addLayout(top)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bl = QHBoxLayout()
         bl.addStretch()
         yes_btn = QPushButton("Сохранить")
         yes_btn.setFixedWidth(90)
-        yes_btn.setDefault(True)
         yes_btn.clicked.connect(self.accept)
         bl.addWidget(yes_btn)
         no_btn = QPushButton("Не сохранять")
@@ -2301,14 +1825,12 @@ class ClearDataDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Очистка данных браузера - Nostalgia")
-        self.setFixedSize(400, 420)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        self.setFixedSize(400, 350)
         if parent:
             geo = parent.geometry()
-            self.move(geo.center().x()-200, geo.center().y()-210)
+            self.move(geo.center().x()-200, geo.center().y()-175)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
         lbl = QLabel("Выберите данные для удаления:")
         lbl.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
         layout.addWidget(lbl)
@@ -2322,20 +1844,14 @@ class ClearDataDialog(QDialog):
         self.cb_cache.setChecked(True)
         self.cb_passwords = QCheckBox("Сохранённые пароли")
         self.cb_bookmarks = QCheckBox("Закладки")
-        self.cb_hsts = QCheckBox("HSTS и SSL кэш")
-        self.cb_storage = QCheckBox("WebSQL/IndexedDB хранилища")
-        self.cb_http_auth = QCheckBox("HTTP аутентификация")
-        self.cb_webgl = QCheckBox("WebGL шейдеры")
-        for cb in [self.cb_history, self.cb_cookies, self.cb_cache, self.cb_passwords, 
-                   self.cb_bookmarks, self.cb_hsts, self.cb_storage, self.cb_http_auth, self.cb_webgl]:
+        for cb in [self.cb_history, self.cb_cookies, self.cb_cache, self.cb_passwords, self.cb_bookmarks]:
             bl.addWidget(cb)
         layout.addWidget(box)
         warn = QLabel("⚠  Действие необратимо!")
-        warn.setStyleSheet("color: red; font-weight: bold;")
+        warn.setStyleSheet("color: red;")
         layout.addWidget(warn)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.button(QDialogButtonBox.StandardButton.Ok).setText("Очистить")
@@ -2353,14 +1869,6 @@ class ClearDataDialog(QDialog):
     def clear_passwords(self): return self.cb_passwords.isChecked()
     @property
     def clear_bookmarks(self): return self.cb_bookmarks.isChecked()
-    @property
-    def clear_hsts(self): return self.cb_hsts.isChecked()
-    @property
-    def clear_storage(self): return self.cb_storage.isChecked()
-    @property
-    def clear_http_auth(self): return self.cb_http_auth.isChecked()
-    @property
-    def clear_webgl(self): return self.cb_webgl.isChecked()
 
 
 class BookmarkManagerDialog(QDialog):
@@ -2369,7 +1877,6 @@ class BookmarkManagerDialog(QDialog):
         self.bookmarks = bookmarks
         self.setWindowTitle("Управление закладками - Nostalgia")
         self.resize(600, 450)
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-300, geo.center().y()-225)
@@ -2378,7 +1885,6 @@ class BookmarkManagerDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Название", "URL"])
         self.tree.setColumnWidth(0, 250)
@@ -2410,9 +1916,7 @@ class BookmarkManagerDialog(QDialog):
     def _refresh(self):
         self.tree.clear()
         for name, url in self.bookmarks.items():
-            safe_name = sanitize_display_text(name, 100)
-            safe_url = sanitize_display_text(url, 100)
-            item = QTreeWidgetItem([safe_name, safe_url])
+            item = QTreeWidgetItem([sanitize_display_text(name, 100), sanitize_display_text(url, 100)])
             self.tree.addTopLevelItem(item)
 
     def _open_bookmark(self, item: QTreeWidgetItem, column):
@@ -2429,9 +1933,6 @@ class BookmarkManagerDialog(QDialog):
         url, ok2 = QInputDialog.getText(self, "Добавить закладку", "URL:")
         if not ok2 or not url:
             return
-        if len(url) > MAX_URL_LENGTH:
-            QMessageBox.warning(self, "Ошибка", "URL слишком длинный.")
-            return
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         if is_safe_url(QUrl(url)):
@@ -2444,14 +1945,11 @@ class BookmarkManagerDialog(QDialog):
             return
         old_name = item.text(0)
         old_url = item.text(1)
-        name, ok1 = QInputDialog.getText(self, "Редактировать", "Название:", text=sanitize_display_text(old_name, 100))
+        name, ok1 = QInputDialog.getText(self, "Редактировать", "Название:", text=old_name)
         if not ok1 or not name:
             return
-        url, ok2 = QInputDialog.getText(self, "Редактировать", "URL:", text=sanitize_display_text(old_url, 100))
+        url, ok2 = QInputDialog.getText(self, "Редактировать", "URL:", text=old_url)
         if not ok2 or not url:
-            return
-        if len(url) > MAX_URL_LENGTH:
-            QMessageBox.warning(self, "Ошибка", "URL слишком длинный.")
             return
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
@@ -2468,78 +1966,35 @@ class BookmarkManagerDialog(QDialog):
             self._refresh()
 
     def _import_bookmarks(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Импорт закладок", 
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
-            "HTML Files (*.html *.htm)"
-        )
-        if not file_path:
-            return
-        
-        try:
-            safe_path = os.path.realpath(file_path)
-            if not os.path.exists(safe_path):
-                QMessageBox.warning(self, "Ошибка", "Файл не существует.")
-                return
-            
-            file_size = os.path.getsize(safe_path)
-            if file_size > MAX_FILE_SIZE:
-                QMessageBox.warning(self, "Ошибка", "Файл слишком большой.")
-                return
-            
-            with open(safe_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            pattern = r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>'
-            matches = re.findall(pattern, content)
-            
-            imported_count = 0
-            for url, name in matches[:MAX_BOOKMARK_IMPORT_COUNT]:
-                if len(url) > MAX_URL_LENGTH:
-                    SafeLogger.warning("URL too long in import: %d characters", len(url))
-                    continue
-                safe_name = html_escape(name.strip())[:200]
-                if is_safe_url(QUrl(url)) and safe_name:
-                    self.bookmarks[safe_name] = url
-                    imported_count += 1
-            
-            self._refresh()
-            QMessageBox.information(self, "Импорт", f"Импортировано {imported_count} закладок.")
-        except Exception as e:
-            SafeLogger.warning("Ошибка импорта закладок: %s", e)
-            QMessageBox.warning(self, "Ошибка", "Не удалось импортировать файл.")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Импорт закладок", "", "HTML Files (*.html *.htm)")
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                matches = re.findall(r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>', content)
+                for url, name in matches[:MAX_BOOKMARK_IMPORT_COUNT]:
+                    safe_name = html_escape(name.strip())[:200]
+                    if is_safe_url(QUrl(url)):
+                        self.bookmarks[safe_name] = url
+                self._refresh()
+                QMessageBox.information(self, "Импорт", f"Импортировано {len(matches)} закладок.")
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", "Не удалось импортировать файл.")
 
     def _export_bookmarks(self):
-        documents_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Экспорт закладок", 
-            os.path.join(documents_dir, "bookmarks.html"),
-            "HTML Files (*.html)"
-        )
-        if not file_path:
-            return
-        
-        try:
-            safe_path = os.path.realpath(file_path)
-            target_dir = os.path.dirname(safe_path)
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir, exist_ok=True)
-            
-            html = ['<!DOCTYPE html><html><head><title>Закладки Nostalgia</title></head>',
-                   '<body><h1>Закладки Nostalgia Browser</h1><ul>']
-            for name, url in self.bookmarks.items():
-                safe_name = html_escape(name)
-                safe_url = html_escape(url)
-                html.append(f'<li><a href="{safe_url}">{safe_name}</a></li>')
-            html.append('</ul></body></html>')
-            
-            with open(safe_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(html))
-            
-            QMessageBox.information(self, "Экспорт", "Закладки экспортированы.")
-        except Exception as e:
-            SafeLogger.warning("Ошибка экспорта закладок: %s", e)
-            QMessageBox.warning(self, "Ошибка", "Не удалось экспортировать файл.")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Экспорт закладок", "bookmarks.html", "HTML Files (*.html)")
+        if file_path:
+            try:
+                html = ['<!DOCTYPE html><html><head><title>Закладки Nostalgia</title></head>',
+                       '<body><h1>Закладки Nostalgia Browser</h1><ul>']
+                for name, url in self.bookmarks.items():
+                    html.append(f'<li><a href="{html_escape(url)}">{html_escape(name)}</a></li>')
+                html.append('</ul></body></html>')
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(html))
+                QMessageBox.information(self, "Экспорт", "Закладки экспортированы.")
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", "Не удалось экспортировать файл.")
 
 
 class CertificateErrorDialog(QDialog):
@@ -2547,15 +2002,12 @@ class CertificateErrorDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Ошибка сертификата - Nostalgia")
         self.setFixedSize(500, 300)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 12)
         icon_label = QLabel()
         icon_label.setFixedSize(48, 48)
         px = QPixmap(48, 48)
         px.fill(Qt.GlobalColor.transparent)
         p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QBrush(QColor(255, 200, 0)))
         p.setPen(QPen(QColor(160, 100, 0), 2))
         p.drawPolygon(QPolygon([QPoint(24, 2), QPoint(46, 45), QPoint(2, 45)]))
@@ -2564,16 +2016,15 @@ class CertificateErrorDialog(QDialog):
         p.drawLine(24, 37, 24, 40)
         p.end()
         icon_label.setPixmap(px)
-        top_layout = QHBoxLayout()
-        top_layout.addWidget(icon_label)
+        top = QHBoxLayout()
+        top.addWidget(icon_label)
         safe_url = html_escape(error.url().toString())
-        error_text = QLabel(f"<b>Ошибка сертификата безопасности</b><br><br>URL: {safe_url}<br><br>Соединение не защищено. Продолжить?")
+        error_text = QLabel(f"<b>Ошибка сертификата безопасности</b><br><br>URL: {safe_url}<br><br>Продолжить?")
         error_text.setWordWrap(True)
-        top_layout.addWidget(error_text, 1)
-        layout.addLayout(top_layout)
+        top.addWidget(error_text, 1)
+        layout.addLayout(top)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -2608,104 +2059,11 @@ class NostalgiaPage(QWebEnginePage):
         self.block_popups = block_popups
         self._blocked = False
         self._incognito = (profile is not None and profile == IncognitoProfile.get())
-        self._install_security_scripts()
         self.certificateError.connect(self._on_certificate_error)
 
     def _on_certificate_error(self, error: QWebEngineCertificateError):
         dialog = CertificateErrorDialog(error, self.view())
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return True
-        return False
-
-    def _install_security_scripts(self):
-        # Исправление #88: WebRTC полностью отключен - НЕТ, для камеры включаем
-        # Для VideoPlayTool нужны WebRTC и WebSocket, поэтому НЕ отключаем
-        security_js = """
-        (function() {
-            'use strict';
-            
-            if (window.__nostalgiaSecurityInstalled) return;
-            window.__nostalgiaSecurityInstalled = true;
-            
-            // НЕ отключаем WebRTC и WebSocket для совместимости с VideoPlayTool
-            // WebRTC оставляем включенным для камеры
-            // WebSocket оставляем включенным
-            
-            // Отключаем только опасные API
-            if (window.SharedWorker) {
-                window.SharedWorker = undefined;
-            }
-            
-            if (window.PaymentRequest) {
-                window.PaymentRequest = undefined;
-            }
-            
-            // Защита от fingerprinting через Canvas (добавляем шум, но не отключаем)
-            if (HTMLCanvasElement.prototype.toDataURL) {
-                var originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                HTMLCanvasElement.prototype.toDataURL = function() {
-                    try {
-                        var context = this.getContext('2d');
-                        if (context) {
-                            var imageData = context.getImageData(0, 0, 1, 1);
-                            if (imageData && imageData.data) {
-                                imageData.data[0] = imageData.data[0] ^ 1;
-                                context.putImageData(imageData, 0, 0);
-                            }
-                        }
-                    } catch(e) {}
-                    return originalToDataURL.apply(this, arguments);
-                };
-            }
-            
-            // Защита от window.opener
-            if (window.opener) {
-                window.opener = null;
-            }
-            
-            // Перехват форм для сохранения паролей
-            document.addEventListener('submit', function(e) {
-                var form = e.target;
-                var pwds = form.querySelectorAll('input[type="password"]');
-                if (pwds.length === 0) return;
-                var loginEl = form.querySelector(
-                    'input[type="text"], input[type="email"], ' +
-                    'input[name*="login"], input[name*="user"], ' +
-                    'input[name*="email"], input[id*="login"], input[id*="user"]'
-                );
-                var login = loginEl ? loginEl.value : '';
-                var pwd = pwds[0].value;
-                if (login && pwd) {
-                    window.__nostalgiaCredentials = {
-                        login: login, password: pwd
-                    };
-                }
-            }, true);
-            
-            // Добавляем заголовки безопасности
-            if (!document.querySelector('meta[http-equiv="X-Frame-Options"]')) {
-                var meta = document.createElement('meta');
-                meta.httpEquiv = 'X-Frame-Options';
-                meta.content = 'SAMEORIGIN';
-                document.head.appendChild(meta);
-            }
-            
-            if (!document.querySelector('meta[http-equiv="X-Content-Type-Options"]')) {
-                var meta2 = document.createElement('meta');
-                meta2.httpEquiv = 'X-Content-Type-Options';
-                meta2.content = 'nosniff';
-                document.head.appendChild(meta2);
-            }
-        })();
-        """
-        
-        script = QWebEngineScript()
-        script.setName("NostalgiaSecurityScript")
-        script.setSourceCode(security_js)
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
-        self.scripts().insert(script)
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         if url.scheme().lower() == "nostalgia":
@@ -2720,18 +2078,13 @@ class NostalgiaPage(QWebEnginePage):
                 self._check_credentials(url)
             if not is_safe_url(url):
                 self._blocked = True
-                scheme = url.scheme()
-                QTimer.singleShot(0, lambda: self.scheme_blocked.emit(scheme))
+                QTimer.singleShot(0, lambda: self.scheme_blocked.emit(url.scheme()))
                 return False
             if self.site_filter.is_blocked(url):
                 self._blocked = True
-                domain = self.site_filter.extract_domain(url)
-                QTimer.singleShot(0, lambda: self.page_blocked.emit(domain))
+                QTimer.singleShot(0, lambda: self.page_blocked.emit(self.site_filter.extract_domain(url)))
                 return False
             self._blocked = False
-        
-        if is_main_frame:
-            self._check_page_size()
         
         return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
@@ -2748,32 +2101,14 @@ class NostalgiaPage(QWebEnginePage):
                 self.credentials_found.emit(url, login, pwd)
             self.runJavaScript("window.__nostalgiaCredentials = null;")
 
-    def _check_page_size(self):
-        self.loadFinished.connect(lambda ok: self._limit_page_content())
-
-    def _limit_page_content(self):
-        self.toHtml(lambda html: self._process_html_size(html))
-
-    def _process_html_size(self, html: str):
-        if len(html.encode('utf-8')) > MAX_PAGE_SIZE:
-            SafeLogger.warning("Page exceeds maximum size: %d bytes", len(html.encode('utf-8')))
-            self.setHtml(validate_and_sanitize_html(
-                "<html><body><h1>Страница слишком большая</h1><p>Размер страницы превышает допустимый лимит.</p></body></html>"
-            ))
-
     def createWindow(self, win_type):
-        if self.block_popups:
-            if win_type in (QWebEnginePage.WebWindowType.WebDialog, QWebEnginePage.WebWindowType.WebBrowserWindow):
-                return None
+        if self.block_popups and win_type in (QWebEnginePage.WebWindowType.WebDialog, QWebEnginePage.WebWindowType.WebBrowserWindow):
+            return None
         
         placeholder = NostalgiaPage(self.site_filter, self.scheme_handler, self.block_popups, self.profile(), self.parent())
         
-        placeholder.loadFinished.connect(lambda: placeholder.runJavaScript("if(window.opener) window.opener = null;"))
-        
         def _on_url(url):
-            if url.isEmpty() or url.toString() == "about:blank":
-                return
-            if is_safe_url(url):
+            if not (url.isEmpty() or url.toString() == "about:blank") and is_safe_url(url):
                 self.open_in_new_tab.emit(url)
             placeholder.deleteLater()
         placeholder.urlChanged.connect(_on_url)
@@ -2799,7 +2134,6 @@ class BrowserTab(QWidget):
         profile = IncognitoProfile.get() if incognito else QWebEngineProfile.defaultProfile()
         page = NostalgiaPage(site_filter, scheme_handler, block_popups, profile, self.webview)
         self.webview.setPage(page)
-        self.webview.page().setBackgroundColor(QColor(255, 255, 255))
         self.webview.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.webview.customContextMenuRequested.connect(self._show_context_menu)
         outer.addWidget(self.webview)
@@ -2837,7 +2171,7 @@ class BrowserTab(QWidget):
         except Exception:
             hit = None
         link_url = hit.linkUrl() if hit else QUrl()
-        if link_url.isValid() and is_safe_url(link_url) and is_safe_external_protocol(link_url):
+        if link_url.isValid() and is_safe_url(link_url):
             open_tab_a = QAction("Открыть ссылку в новой вкладке", self)
             open_tab_a.triggered.connect(lambda: self.nostalgia_page.open_in_new_tab.emit(link_url))
             menu.addAction(open_tab_a)
@@ -2855,16 +2189,13 @@ class BrowserTab(QWidget):
             zoom_menu.addAction(za)
         menu.addSeparator()
         src_a = QAction("Просмотр кода страницы", self)
-        src_a.triggered.connect(self._view_source)
+        src_a.triggered.connect(lambda: self.webview.page().toHtml(lambda html: self._show_source_dialog(html)))
         menu.addAction(src_a)
         menu.exec(self.webview.mapToGlobal(pos))
 
-    def _view_source(self):
-        self.webview.page().toHtml(self._show_source_dialog)
-
     def _show_source_dialog(self, html: str):
         dlg = QDialog(self)
-        dlg.setWindowTitle("Исходный код страницы - Nostalgia")
+        dlg.setWindowTitle("Исходный код страницы")
         dlg.resize(800, 600)
         layout = QVBoxLayout(dlg)
         te = QTextEdit()
@@ -2882,22 +2213,17 @@ class BlockedDialog(QDialog):
     def __init__(self, domain: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nostalgia Browser")
-        self.setFixedSize(380, 220)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        self.setFixedSize(380, 200)
         if parent:
             geo = parent.geometry()
-            self.move(geo.center().x()-190, geo.center().y()-110)
+            self.move(geo.center().x()-190, geo.center().y()-100)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
-        layout.setSpacing(10)
-        top = QHBoxLayout()
-        top.setSpacing(14)
         icon_label = QLabel()
         icon_label.setFixedSize(48, 48)
         px = QPixmap(48, 48)
         px.fill(Qt.GlobalColor.transparent)
         p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QBrush(QColor(200, 0, 0)))
         p.setPen(QPen(QColor(140, 0, 0), 2))
         p.drawEllipse(2, 2, 44, 44)
@@ -2906,22 +2232,19 @@ class BlockedDialog(QDialog):
         p.drawLine(34, 14, 14, 34)
         p.end()
         icon_label.setPixmap(px)
+        top = QHBoxLayout()
         top.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignTop)
-        safe_domain = html_escape(domain)
-        msg = QLabel(f"<b>Сайт заблокирован</b><br><br>Доступ к сайту <b>{safe_domain}</b> ограничен настройками фильтрации.<br><br>Обратитесь к администратору.")
+        msg = QLabel(f"<b>Сайт заблокирован</b><br><br>Доступ к сайту <b>{html_escape(domain)}</b> ограничен.")
         msg.setWordWrap(True)
-        msg.setTextFormat(Qt.TextFormat.RichText)
         top.addWidget(msg, 1)
         layout.addLayout(top)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bl = QHBoxLayout()
         bl.addStretch()
         ok = QPushButton("  ОК  ")
         ok.setFixedWidth(80)
-        ok.setDefault(True)
         ok.clicked.connect(self.accept)
         bl.addWidget(ok)
         bl.addStretch()
@@ -2932,22 +2255,17 @@ class SchemeBlockedDialog(QDialog):
     def __init__(self, scheme: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Nostalgia Browser")
-        self.setFixedSize(380, 200)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        self.setFixedSize(380, 180)
         if parent:
             geo = parent.geometry()
-            self.move(geo.center().x()-190, geo.center().y()-100)
+            self.move(geo.center().x()-190, geo.center().y()-90)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
-        layout.setSpacing(10)
-        top = QHBoxLayout()
-        top.setSpacing(14)
         icon_label = QLabel()
         icon_label.setFixedSize(48, 48)
         px = QPixmap(48, 48)
         px.fill(Qt.GlobalColor.transparent)
         p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QBrush(QColor(255, 200, 0)))
         p.setPen(QPen(QColor(160, 100, 0), 2))
         p.drawPolygon(QPolygon([QPoint(24, 2), QPoint(46, 45), QPoint(2, 45)]))
@@ -2956,22 +2274,19 @@ class SchemeBlockedDialog(QDialog):
         p.drawLine(24, 37, 24, 40)
         p.end()
         icon_label.setPixmap(px)
+        top = QHBoxLayout()
         top.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignTop)
-        safe_scheme = html_escape(scheme)
-        msg = QLabel(f"<b>Протокол не поддерживается</b><br><br>Схема <b>{safe_scheme}://</b> заблокирована.<br>Разрешены только <b>http://</b>, <b>https://</b>, <b>ws://</b> и <b>wss://</b>.")
+        msg = QLabel(f"<b>Протокол не поддерживается</b><br><br>Схема <b>{html_escape(scheme)}://</b> заблокирована.")
         msg.setWordWrap(True)
-        msg.setTextFormat(Qt.TextFormat.RichText)
         top.addWidget(msg, 1)
         layout.addLayout(top)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bl = QHBoxLayout()
         bl.addStretch()
         ok = QPushButton("  ОК  ")
         ok.setFixedWidth(80)
-        ok.setDefault(True)
         ok.clicked.connect(self.accept)
         bl.addWidget(ok)
         bl.addStretch()
@@ -2981,26 +2296,23 @@ class SchemeBlockedDialog(QDialog):
 class HomepageDialog(QDialog):
     def __init__(self, current_homepage: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Настройка домашней страницы - Nostalgia")
+        self.setWindowTitle("Настройка домашней страницы")
         self.setFixedSize(460, 160)
-        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-230, geo.center().y()-80)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(10)
         form = QFormLayout()
         self.url_edit = QLineEdit(current_homepage)
         self.url_edit.setMinimumWidth(340)
         form.addRow("Домашняя страница:", self.url_edit)
         layout.addLayout(form)
-        hint = QLabel("Пример: https://www.google.com  •  Только http://, https://, ws://, wss://")
+        hint = QLabel("Пример: https://www.google.com")
         hint.setStyleSheet("color: gray; font-size: 8pt;")
         layout.addWidget(hint)
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._validate_and_accept)
@@ -3010,13 +2322,13 @@ class HomepageDialog(QDialog):
     def _validate_and_accept(self):
         raw = self.url_edit.text().strip()
         if not raw:
-            QMessageBox.warning(self, "Ошибка", "Введите адрес домашней страницы.")
+            QMessageBox.warning(self, "Ошибка", "Введите адрес.")
             return
-        if not raw.startswith(("http://", "https://", "ws://", "wss://")):
+        if not raw.startswith(("http://", "https://")):
             raw = "https://" + raw
         q = QUrl(raw)
         if not q.isValid() or not is_safe_url(q):
-            QMessageBox.warning(self, "Ошибка", "Недопустимый адрес.\nИспользуйте http://, https://, ws:// или wss://.")
+            QMessageBox.warning(self, "Ошибка", "Недопустимый адрес.")
             return
         self.result_url = raw
         self.accept()
@@ -3109,10 +2421,6 @@ class NostalgiaBrowser(QMainWindow):
         self._profile.setCachePath(os.path.join(self._profile_dir, "cache"))
         self._profile.setPersistentStoragePath(os.path.join(self._profile_dir, "storage"))
         
-        # Добавляем перехватчик для заголовков безопасности (исправленный метод)
-        self._security_interceptor = SecurityHeadersInterceptor()
-        self._profile.setUrlRequestInterceptor(self._security_interceptor)
-        
         self.site_filter = SiteFilter()
         self.scheme_handler = NostalgiaPageHandler()
         self.bookmarks = {}
@@ -3121,18 +2429,17 @@ class NostalgiaBrowser(QMainWindow):
         self.block_popups = True
         self.current_theme = "Классическая (Windows 98)"
         self.current_engine = "Google"
-        self.loading_tabs: dict[BrowserTab, TabLoadingWidget] = {}
+        self.loading_tabs: dict = {}
         self.password_manager = SecurePasswordManager(parent_widget=self)
-        self._download_manager: DownloadManagerDialog | None = None
+        self._download_manager = None
         self._navigation_limiter = RateLimiter(NAVIGATION_RATE_LIMIT)
         self._active_downloads = 0
-        self._clipboard_cleanup_timer: Optional[QTimer] = None
+        self._clipboard_cleanup_timer = None
         self.tab_manager = None
         self.download_security = DownloadSecurityManager()
 
         self.setup_profile()
         self.load_settings()
-
         self.create_menubar()
         self.create_toolbars()
         self.create_tabs()
@@ -3164,7 +2471,6 @@ class NostalgiaBrowser(QMainWindow):
         
         incognito = IncognitoProfile.get()
         incognito.downloadRequested.connect(self._on_download_requested)
-        incognito.setUrlRequestInterceptor(self._security_interceptor)
 
         settings = profile.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
@@ -3174,12 +2480,10 @@ class NostalgiaBrowser(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
-        
-        # Включаем WebRTC для камеры
         settings.setAttribute(QWebEngineSettings.WebAttribute.WebRTCPublicInterfacesOnly, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.DnsPrefetchEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ErrorPageEnabled, True)
-        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)  # Включаем WebGL
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadIconsForPage, False)
         
         profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
@@ -3196,7 +2500,6 @@ class NostalgiaBrowser(QMainWindow):
         clipboard.clear()
         
         if hasattr(self, 'password_manager'):
-            self.password_manager.lock()
             self.password_manager.clear_secure_items()
         
         if self._clipboard_cleanup_timer:
@@ -3221,125 +2524,75 @@ class NostalgiaBrowser(QMainWindow):
 
     def _on_download_requested(self, download: QWebEngineDownloadRequest):
         if self._active_downloads >= MAX_DOWNLOADS_SIMULTANEOUS:
-            SafeLogger.warning("Download limit reached: %d", self._active_downloads)
             download.cancel()
-            QMessageBox.warning(self, "Слишком много загрузок", f"Достигнут лимит одновременных загрузок ({MAX_DOWNLOADS_SIMULTANEOUS}).")
+            QMessageBox.warning(self, "Слишком много загрузок", f"Лимит {MAX_DOWNLOADS_SIMULTANEOUS}")
             return
 
-        mime_type = download.mimeType()
         original_filename = download.downloadFileName() or "download"
         safe_filename = DownloadSecurityManager.sanitize_filename(original_filename)
         
         content_length = download.totalBytes()
-        if content_length > 0 and content_length > MAX_DOWNLOAD_SIZE:
-            SafeLogger.warning("File too large: %d bytes", content_length)
+        if content_length > MAX_DOWNLOAD_SIZE:
             download.cancel()
-            QMessageBox.warning(self, "Файл слишком большой", f"Размер файла превышает максимально допустимый.")
+            QMessageBox.warning(self, "Файл слишком большой", "")
             return
 
-        _, ext = os.path.splitext(safe_filename)
-        origin = download.url().toString()
-        
-        if not DownloadSecurityManager.is_safe_download(mime_type, ext, content_length, origin):
-            reply = QMessageBox.warning(
-                self, "Потенциально опасный файл",
-                f"Файл «{sanitize_display_text(safe_filename, 50)}» (тип: {mime_type}) может быть опасным. Продолжить загрузку?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                download.cancel()
-                return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить файл",
-            os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation), safe_filename),
-            "Все файлы (*.*)"
-        )
+        save_path, _ = QFileDialog.getSaveFileName(self, "Сохранить файл",
+            os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation), safe_filename))
         if not save_path:
-            download.cancel()
-            return
-
-        safe_save_path = os.path.realpath(save_path)
-        allowed_dir = os.path.realpath(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation))
-        
-        if not safe_save_path.startswith(allowed_dir):
-            SafeLogger.warning("Path traversal attempt in download: %s", safe_save_path)
             download.cancel()
             return
 
         self._active_downloads += 1
 
         def on_download_finished():
-            self._active_downloads = max(0, self._active_downloads - 1)
-            if download.state() == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
-                file_path = os.path.join(download.downloadDirectory(), download.downloadFileName())
-                file_hash = DownloadSecurityManager.calculate_file_hash(file_path)
-                if file_hash:
-                    SafeLogger.info("File downloaded successfully. Hash: %s", file_hash)
+            self._active_downloads -= 1
 
         download.isFinishedChanged.connect(on_download_finished)
-        download.setDownloadDirectory(os.path.dirname(safe_save_path))
-        download.setDownloadFileName(os.path.basename(safe_save_path))
+        download.setDownloadDirectory(os.path.dirname(save_path))
+        download.setDownloadFileName(os.path.basename(save_path))
         download.accept()
 
         if self._download_manager is None:
             self._download_manager = DownloadManagerDialog(self)
         self._download_manager.add_download(download)
-        SafeLogger.info("Download started: %s", sanitize_display_text(safe_filename, 50))
 
     def load_settings(self):
         try:
             if os.path.exists('nostalgia_settings.json'):
                 data = SecureFileHandler.safe_read_json('nostalgia_settings.json')
-                if not data:
-                    SafeLogger.warning("Using default settings due to corrupted config")
-                    return
-                raw_bm = data.get('bookmarks', {})
-                if isinstance(raw_bm, dict):
-                    self.bookmarks = {}
-                    for k, v in raw_bm.items():
-                        if (isinstance(k, str) and isinstance(v, str) and len(k) <= 200 and len(v) <= MAX_URL_LENGTH and is_safe_url(QUrl(v))):
-                            safe_name = sanitize_display_text(k, 200)
-                            if safe_name:
-                                self.bookmarks[safe_name] = v
-                raw_hist = data.get('history', [])
-                self.history = []
-                if isinstance(raw_hist, list):
-                    for e in raw_hist[:MAX_HISTORY_ENTRIES]:
-                        if not isinstance(e, dict):
-                            continue
-                        safe_url = sanitize_url_for_history(e.get('url', ''))
-                        if not safe_url:
-                            continue
-                        self.history.append({
-                            'url': safe_url,
-                            'title': sanitize_display_text(str(e.get('title', ''))[:MAX_TITLE_LENGTH], MAX_TITLE_LENGTH),
-                            'time': str(e.get('time', ''))[:50],
-                        })
-                raw_hp = data.get('homepage', 'https://www.google.com')
-                if isinstance(raw_hp, str) and is_safe_url(QUrl(raw_hp)) and len(raw_hp) <= MAX_URL_LENGTH:
-                    self.homepage = raw_hp
-                self.block_popups = bool(data.get('block_popups', True))
-                raw_theme = data.get('theme', 'Классическая (Windows 98)')
-                self.current_theme = raw_theme if raw_theme in THEMES else 'Классическая (Windows 98)'
-                raw_engine = data.get('search_engine', 'Google')
-                self.current_engine = raw_engine if raw_engine in SEARCH_ENGINES else 'Google'
+                if data:
+                    raw_bm = data.get('bookmarks', {})
+                    if isinstance(raw_bm, dict):
+                        self.bookmarks = {}
+                        for k, v in raw_bm.items():
+                            if isinstance(v, str) and is_safe_url(QUrl(v)):
+                                self.bookmarks[k] = v
+                    
+                    raw_hist = data.get('history', [])
+                    if isinstance(raw_hist, list):
+                        self.history = []
+                        for e in raw_hist[:MAX_HISTORY_ENTRIES]:
+                            if isinstance(e, dict):
+                                self.history.append(e)
+                    
+                    raw_hp = data.get('homepage', 'https://www.google.com')
+                    if isinstance(raw_hp, str) and is_safe_url(QUrl(raw_hp)):
+                        self.homepage = raw_hp
+                    
+                    self.block_popups = bool(data.get('block_popups', True))
+                    raw_theme = data.get('theme', 'Классическая (Windows 98)')
+                    self.current_theme = raw_theme if raw_theme in THEMES else 'Классическая (Windows 98)'
+                    raw_engine = data.get('search_engine', 'Google')
+                    self.current_engine = raw_engine if raw_engine in SEARCH_ENGINES else 'Google'
         except Exception as e:
-            SafeLogger.warning("Critical error loading settings: %s", e)
+            SafeLogger.warning("Error loading settings: %s", e)
 
     def save_settings(self):
         try:
-            history_to_save = self.history[-MAX_HISTORY_ENTRIES:]
-            cleaned_history = []
-            for entry in history_to_save:
-                cleaned_entry = entry.copy()
-                if 'url' in cleaned_entry:
-                    cleaned_entry['url'] = sanitize_url_for_history(cleaned_entry['url'])
-                cleaned_history.append(cleaned_entry)
             data = {
                 'bookmarks': self.bookmarks,
-                'history': cleaned_history,
+                'history': self.history[-MAX_HISTORY_ENTRIES:],
                 'homepage': self.homepage,
                 'block_popups': self.block_popups,
                 'theme': self.current_theme,
@@ -3347,7 +2600,7 @@ class NostalgiaBrowser(QMainWindow):
             }
             SecureFileHandler.safe_write_json('nostalgia_settings.json', data)
         except Exception as e:
-            SafeLogger.warning("Ошибка сохранения настроек: %s", e)
+            SafeLogger.warning("Error saving settings: %s", e)
 
     def create_menubar(self):
         mb = self.menuBar()
@@ -3356,7 +2609,7 @@ class NostalgiaBrowser(QMainWindow):
         a.setShortcut("Ctrl+T")
         a.triggered.connect(lambda: self.add_new_tab(QUrl(self.homepage)))
         fm.addAction(a)
-        a = QAction("🕵  Новая вкладка &инкогнито", self)
+        a = QAction("🕵 Новая вкладка &инкогнито", self)
         a.setShortcut("Ctrl+Shift+N")
         a.triggered.connect(self.open_incognito_tab)
         fm.addAction(a)
@@ -3376,22 +2629,9 @@ class NostalgiaBrowser(QMainWindow):
         a.triggered.connect(self.reload_page)
         vm.addAction(a)
         vm.addSeparator()
-        zm = vm.addMenu("&Масштаб")
-        for txt, sc, fn in [("Увеличить  (+)", "Ctrl++", self.zoom_in), ("Уменьшить  (-)", "Ctrl+-", self.zoom_out), ("Обычный  (100%)", "Ctrl+0", self.zoom_reset)]:
-            a = QAction(txt, self)
-            a.setShortcut(sc)
-            a.triggered.connect(fn)
-            zm.addAction(a)
-        zm.addSeparator()
-        for pct in (75, 90, 100, 110, 125, 150, 175, 200):
-            a = QAction(f"{pct}%", self)
-            a.triggered.connect((lambda z: lambda: self._set_zoom(z/100))(pct))
-            zm.addAction(a)
-        vm.addSeparator()
         a = QAction("🎨 &Темы оформления...", self)
         a.triggered.connect(self.show_theme_dialog)
         vm.addAction(a)
-        vm.addSeparator()
         a = QAction("&Полный экран", self)
         a.setShortcut("F11")
         a.triggered.connect(self.toggle_fullscreen)
@@ -3422,13 +2662,10 @@ class NostalgiaBrowser(QMainWindow):
         a = QAction("🔍 Поисковые &системы...", self)
         a.triggered.connect(self.show_search_engine_dialog)
         tm.addAction(a)
-        a = QAction("🍪 Управление &cookie...", self)
-        a.triggered.connect(self.show_cookie_manager)
-        tm.addAction(a)
         a = QAction("🔑 Управление &паролями...", self)
         a.triggered.connect(self.show_password_manager)
         tm.addAction(a)
-        a = QAction("🗑  &Очистить данные браузера...", self)
+        a = QAction("🗑 &Очистить данные браузера...", self)
         a.setShortcut("Ctrl+Shift+Del")
         a.triggered.connect(self.show_clear_data_dialog)
         tm.addAction(a)
@@ -3451,8 +2688,7 @@ class NostalgiaBrowser(QMainWindow):
         for action in self.fav_menu.actions()[3:]:
             self.fav_menu.removeAction(action)
         for name, url in self.bookmarks.items():
-            safe_name = sanitize_display_text(name, 50)
-            a = QAction(safe_name, self)
+            a = QAction(sanitize_display_text(name, 50), self)
             a.triggered.connect((lambda u: lambda: self.load_url(u))(url))
             self.fav_menu.addAction(a)
 
@@ -3477,7 +2713,6 @@ class NostalgiaBrowser(QMainWindow):
         self.nav_toolbar.addSeparator()
         zob = QPushButton("A-")
         zob.setFixedWidth(32)
-        zob.setToolTip("Уменьшить (Ctrl+-)")
         zob.clicked.connect(self.zoom_out)
         self.nav_toolbar.addWidget(zob)
         self.zoom_label = QLabel("100%")
@@ -3486,7 +2721,6 @@ class NostalgiaBrowser(QMainWindow):
         self.nav_toolbar.addWidget(self.zoom_label)
         zib = QPushButton("A+")
         zib.setFixedWidth(32)
-        zib.setToolTip("Увеличить (Ctrl++)")
         zib.clicked.connect(self.zoom_in)
         self.nav_toolbar.addWidget(zib)
         self.address_toolbar = QToolBar("Адресная строка")
@@ -3496,7 +2730,7 @@ class NostalgiaBrowser(QMainWindow):
         self.address_toolbar.addWidget(self.address_label)
         self.url_bar = QLineEdit()
         self.url_bar.setMinimumWidth(400)
-        self.url_bar.setPlaceholderText("Введите адрес веб-страницы")
+        self.url_bar.setPlaceholderText("Введите адрес")
         self.url_bar.returnPressed.connect(self.navigate_to_url)
         self.address_toolbar.addWidget(self.url_bar)
         gb = QPushButton("Переход")
@@ -3535,7 +2769,6 @@ class NostalgiaBrowser(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.focus_url_bar)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_find_bar)
         QShortcut(QKeySequence("Ctrl++"), self, activated=self.zoom_in)
-        QShortcut(QKeySequence("Ctrl+="), self, activated=self.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self, activated=self.zoom_out)
         QShortcut(QKeySequence("Ctrl+0"), self, activated=self.zoom_reset)
         QShortcut(QKeySequence("Ctrl+J"), self, activated=self.show_downloads)
@@ -3548,22 +2781,13 @@ class NostalgiaBrowser(QMainWindow):
 
     def _safe_add_to_history(self, entry: dict):
         url = entry.get('url', '')
-        if not url or url in ("about:blank", ""):
+        if not url:
             return
-        
-        safe_url = sanitize_url_for_history(url)
-        if not safe_url:
-            return
-        
-        if not self.tab_manager.can_redirect():
-            return
-        
         self._history_queue.append({
-            'url': safe_url,
+            'url': url,
             'title': entry.get('title', '')[:MAX_TITLE_LENGTH],
             'time': datetime.datetime.now().isoformat()
         })
-        
         if len(self._history_queue) > MAX_HISTORY_WRITE_QUEUE:
             self._flush_history_queue()
         else:
@@ -3572,27 +2796,10 @@ class NostalgiaBrowser(QMainWindow):
     def _flush_history_queue(self):
         if not self._history_queue:
             return
-        
         for entry in self._history_queue:
-            now = MonotonicTime.datetime_now()
-            cutoff = now - datetime.timedelta(minutes=DEDUP_TIME_MINUTES)
-            
-            duplicate = False
-            for recent in reversed(self.history[-RECENT_HISTORY_CHECK:]):
-                if recent.get('url') == entry.get('url'):
-                    try:
-                        recent_time = datetime.datetime.fromisoformat(recent.get('time', ''))
-                        if recent_time > cutoff:
-                            duplicate = True
-                            break
-                    except (ValueError, TypeError):
-                        pass
-            
-            if not duplicate:
-                if len(self.history) >= MAX_HISTORY_ENTRIES:
-                    self.history = self.history[-MAX_HISTORY_ENTRIES//2:]
-                self.history.append(entry)
-        
+            if len(self.history) >= MAX_HISTORY_ENTRIES:
+                self.history = self.history[-MAX_HISTORY_ENTRIES//2:]
+            self.history.append(entry)
         self._history_queue.clear()
         self.save_settings()
 
@@ -3601,49 +2808,37 @@ class NostalgiaBrowser(QMainWindow):
 
     def add_new_tab(self, url=None, title="Новая вкладка", incognito: bool = False):
         if not self.tab_manager.can_add_tab():
-            QMessageBox.warning(self, "Слишком много вкладок", f"Достигнуто максимальное количество вкладок ({MAX_TABS}).")
+            QMessageBox.warning(self, "Слишком много вкладок", f"Максимум {MAX_TABS}")
             return None
         if url is None:
             url = QUrl("about:blank")
         elif isinstance(url, str):
             url = QUrl(url)
-        if (not url.isEmpty() and url.toString() != "about:blank" and url.scheme() != "nostalgia"):
-            if url.scheme().lower() in BLOCKED_SCHEMES:
-                self.status_label.setText(f"Заблокировано: схема «{html_escape(url.scheme())}» не разрешена")
-                return None
-            if not is_safe_url(url):
-                self.status_label.setText("Заблокировано: небезопасная схема URL")
-                return None
+        
         tab = BrowserTab(self.site_filter, self.scheme_handler, self.block_popups, incognito)
-        safe_title = sanitize_display_text(title, MAX_DISPLAY_LENGTH)
-        index = self.tab_widget.addTab(tab, safe_title)
+        index = self.tab_widget.addTab(tab, sanitize_display_text(title, MAX_DISPLAY_LENGTH))
         self.tab_widget.setCurrentIndex(index)
-        page: NostalgiaPage = tab.nostalgia_page
+        
+        page = tab.nostalgia_page
         page.open_in_new_tab.connect(lambda u, inc=incognito: self.add_new_tab(u, incognito=inc))
         page.page_blocked.connect(lambda domain, t=tab: self._on_site_blocked(t, domain))
         page.scheme_blocked.connect(lambda scheme, t=tab: self._on_scheme_blocked(t, scheme))
         if not incognito:
             page.credentials_found.connect(self._on_credentials_found)
+        
         wv = tab.webview
         wv.loadStarted.connect(lambda t=tab: self.on_load_started(t))
         wv.loadFinished.connect(lambda ok, t=tab: self.on_load_finished(t, ok))
         wv.urlChanged.connect(lambda u, t=tab: self.on_url_changed(u, t))
         wv.titleChanged.connect(lambda txt, t=tab: self.update_tab_title_by_tab(t, txt))
         wv.loadProgress.connect(lambda p, t=tab: self.update_progress(p, t))
-        wv.urlChanged.connect(lambda u, t=tab: self._sync_zoom_label(t))
         wv.setUrl(url)
         return tab
 
     def _on_credentials_found(self, url: str, login: str, pwd: str):
-        existing = self.password_manager.find_for_url(url)
-        for e in existing:
-            if e['login'] == login:
-                secure_zero_memory(pwd)
-                return
         dlg = SavePasswordDialog(url, login, pwd, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.password_manager.add(url, login, pwd)
-        secure_zero_memory(pwd)
 
     def on_load_started(self, tab: BrowserTab):
         if tab not in self.loading_tabs:
@@ -3656,7 +2851,7 @@ class NostalgiaBrowser(QMainWindow):
         self.globe.start()
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.status_label.setText("Поиск узла...")
+        self.status_label.setText("Загрузка...")
 
     def on_load_finished(self, tab: BrowserTab, ok: bool):
         if tab in self.loading_tabs:
@@ -3680,11 +2875,7 @@ class NostalgiaBrowser(QMainWindow):
                 if url.scheme() != "nostalgia":
                     safe_url = sanitize_url_for_history(url.toString())
                     if safe_url:
-                        self._safe_add_to_history({
-                            'url': safe_url,
-                            'title': tab.webview.title(),
-                            'time': datetime.datetime.now().isoformat()
-                        })
+                        self._safe_add_to_history({'url': safe_url, 'title': tab.webview.title()})
         else:
             self.status_label.setText("Ошибка загрузки")
 
@@ -3699,40 +2890,35 @@ class NostalgiaBrowser(QMainWindow):
                 self.loading_tabs[tab].set_stage(1)
             else:
                 self.loading_tabs[tab].set_stage(2)
-        if progress < 30:
-            self.status_label.setText("Поиск узла...")
-        elif progress < 60:
-            self.status_label.setText("Ожидание ответа...")
-        elif progress < 90:
-            self.status_label.setText("Загрузка страницы...")
-        else:
-            self.status_label.setText("Завершение...")
 
     def on_url_changed(self, url: QUrl, tab: BrowserTab):
         if self.tab_widget.currentWidget() is tab:
             self.url_bar.setText("" if url.scheme() == "nostalgia" else url.toString())
             if url.scheme() == "https":
-                self.zone_label.setText("🔒 Надежный узел")
+                self.zone_label.setText("🔒 HTTPS")
                 self.zone_label.setStyleSheet("color: green;")
             elif url.scheme() == "http":
-                self.zone_label.setText("⚠ Не защищено")
-                self.zone_label.setStyleSheet("color: orange;")
+                if is_local_url(url):
+                    self.zone_label.setText("🏠 Локальная сеть")
+                    self.zone_label.setStyleSheet("color: blue;")
+                else:
+                    self.zone_label.setText("⚠ HTTP")
+                    self.zone_label.setStyleSheet("color: orange;")
             else:
-                self.zone_label.setText("Зона Интернета")
+                self.zone_label.setText("🌐")
                 self.zone_label.setStyleSheet("")
         
-        if url.host() and url.scheme() in ('http', 'https'):
+        if url.host() and url.scheme() in ('http', 'https') and not is_local_url(url):
             if not self.tab_manager.resolve_and_check_dns(url.host()):
                 tab.webview.stop()
-                self.status_label.setText("DNS rebinding detected! Connection blocked.")
+                self.status_label.setText("DNS rebinding detected!")
                 return
         
         idx = self.tab_widget.indexOf(tab)
         if idx >= 0:
             if not self.tab_manager.track_redirect_chain(idx, url.toString()):
-                SafeLogger.warning("Redirect chain too long for tab %d", idx)
                 tab.webview.stop()
-                self.status_label.setText("Слишком много редиректов")
+                self.status_label.setText("Too many redirects")
                 return
 
     def update_tab_title_by_tab(self, tab: BrowserTab, title: str):
@@ -3741,22 +2927,16 @@ class NostalgiaBrowser(QMainWindow):
             return
         title = sanitize_display_text(title, MAX_TITLE_LENGTH)
         display = sanitize_display_text(title, MAX_DISPLAY_LENGTH)
-        safe_tooltip = sanitize_display_text(title, 200)
-        self.tab_widget.setTabToolTip(idx, safe_tooltip)
         if tab.is_incognito and not display.startswith("🕵"):
             display = "🕵 " + display
         self.tab_widget.setTabText(idx, display)
         if idx == self.tab_widget.currentIndex():
-            self.setWindowTitle(f"{display} - Nostalgia Browser")
+            self.setWindowTitle(f"{display} - Nostalgia")
         url_str = tab.webview.url().toString()
         for e in reversed(self.history):
             if e.get('url') == url_str and not e.get('title'):
-                e['title'] = sanitize_display_text(title, MAX_TITLE_LENGTH)
+                e['title'] = title
                 break
-
-    def _sync_zoom_label(self, tab: BrowserTab):
-        if self.tab_widget.currentWidget() is tab:
-            self.zoom_label.setText(f"{int(tab.webview.zoomFactor()*100)}%")
 
     def _stop_loading_for_tab(self, tab: BrowserTab):
         if tab in self.loading_tabs:
@@ -3778,12 +2958,12 @@ class NostalgiaBrowser(QMainWindow):
 
     def _on_scheme_blocked(self, tab: BrowserTab, scheme: str):
         self._stop_loading_for_tab(tab)
-        self.status_label.setText(f"Заблокировано: схема «{html_escape(scheme)}» не разрешена")
+        self.status_label.setText(f"Схема {scheme} заблокирована")
         SchemeBlockedDialog(scheme, self).exec()
 
     def navigate_to_url(self):
         if not self._navigation_limiter.can_proceed():
-            self.status_label.setText("Слишком много запросов. Подождите...")
+            self.status_label.setText("Слишком много запросов")
             return
         text = self.url_bar.text().strip()
         if not text:
@@ -3791,42 +2971,43 @@ class NostalgiaBrowser(QMainWindow):
         
         sanitized_url = SanitizedUrl.sanitize(text)
         if not sanitized_url:
-            self.status_label.setText("Недопустимый URL")
+            self.status_label.setText("Неверный URL")
             return
         
         try:
             parsed = urlparse(sanitized_url)
             if parsed.scheme.lower() in BLOCKED_SCHEMES:
-                self.status_label.setText(f"Заблокировано: схема «{html_escape(parsed.scheme)}» не разрешена")
+                self.status_label.setText(f"Схема {parsed.scheme} заблокирована")
                 return
             
-            if sanitized_url.startswith(("http://", "https://", "about:", "ws://", "wss://")):
+            if sanitized_url.startswith(("http://", "https://", "about:")):
                 url = QUrl(sanitized_url)
             elif "." in sanitized_url and " " not in sanitized_url:
-                if not sanitized_url.startswith(("http://", "https://")):
-                    url = QUrl("https://" + sanitized_url)
-                else:
-                    url = QUrl(sanitized_url)
+                url = QUrl("https://" + sanitized_url)
             else:
                 tmpl = SEARCH_ENGINES.get(self.current_engine, SEARCH_ENGINES["Google"])
-                safe_query = quote_plus(sanitize_search_query(sanitized_url))
-                url = QUrl(tmpl.replace("{query}", safe_query))
+                url = QUrl(tmpl.replace("{query}", quote_plus(sanitize_search_query(sanitized_url))))
             
             if not url.isValid():
-                raise ValueError(f"Невалидный URL")
+                raise ValueError("Неверный URL")
+            
+            if is_local_url(url) and url.scheme() == 'https':
+                url.setScheme('http')
+            
             if not is_safe_url(url):
-                self.status_label.setText(f"Заблокировано: схема «{html_escape(url.scheme())}» не разрешена")
+                self.status_label.setText(f"Схема {url.scheme()} заблокирована")
                 return
             self.load_url(url)
         except Exception as e:
-            self.status_label.setText(f"Ошибка: {sanitize_display_text(str(e), 100)}")
+            self.status_label.setText(f"Ошибка: {str(e)[:100]}")
 
     def load_url(self, url):
         if isinstance(url, str):
             url = QUrl(url)
-        if not is_safe_url(url) and url.scheme() != "nostalgia":
-            self.status_label.setText(f"Заблокировано: схема «{html_escape(url.scheme())}» не разрешена")
-            return
+        if is_local_url(url) and url.scheme() == 'https':
+            new_url = QUrl(url)
+            new_url.setScheme('http')
+            url = new_url
         wv = self.get_current_webview()
         if wv:
             wv.setUrl(url)
@@ -3848,7 +3029,7 @@ class NostalgiaBrowser(QMainWindow):
         if not self.loading_tabs:
             self.globe.stop()
             self.progress_bar.setVisible(False)
-        self.status_label.setText("Загрузка остановлена")
+        self.status_label.setText("Остановлено")
 
     def reload_page(self):
         wv = self.get_current_webview()
@@ -3868,15 +3049,18 @@ class NostalgiaBrowser(QMainWindow):
             url = tab.webview.url()
             self.url_bar.setText("" if url.scheme() == "nostalgia" else url.toString())
             if url.scheme() == "https":
-                self.zone_label.setText("🔒 Надежный узел")
+                self.zone_label.setText("🔒 HTTPS")
                 self.zone_label.setStyleSheet("color: green;")
             elif url.scheme() == "http":
-                self.zone_label.setText("⚠ Не защищено")
-                self.zone_label.setStyleSheet("color: orange;")
+                if is_local_url(url):
+                    self.zone_label.setText("🏠 Локальная")
+                    self.zone_label.setStyleSheet("color: blue;")
+                else:
+                    self.zone_label.setText("⚠ HTTP")
+                    self.zone_label.setStyleSheet("color: orange;")
             else:
-                self.zone_label.setText("Зона Интернета")
+                self.zone_label.setText("🌐")
                 self.zone_label.setStyleSheet("")
-            self.zoom_label.setText(f"{int(tab.webview.zoomFactor()*100)}%")
 
     def close_tab(self, index: int):
         if self.tab_widget.count() > 1:
@@ -3885,12 +3069,10 @@ class NostalgiaBrowser(QMainWindow):
                 self.tab_manager.clear_redirect_chain(index)
                 if tab in self.loading_tabs:
                     self.loading_tabs[tab].stop()
-                    self.loading_tabs[tab].deleteLater()
                     del self.loading_tabs[tab]
                 wv = tab.webview
                 wv.stop()
                 wv.setUrl(QUrl("about:blank"))
-                wv.page().deleteLater()
             self.tab_widget.removeTab(index)
             if tab:
                 tab.deleteLater()
@@ -3906,13 +3088,11 @@ class NostalgiaBrowser(QMainWindow):
 
     def next_tab(self):
         current = self.tab_widget.currentIndex()
-        next_idx = (current + 1) % self.tab_widget.count()
-        self.tab_widget.setCurrentIndex(next_idx)
+        self.tab_widget.setCurrentIndex((current + 1) % self.tab_widget.count())
 
     def prev_tab(self):
         current = self.tab_widget.currentIndex()
-        prev_idx = (current - 1) % self.tab_widget.count()
-        self.tab_widget.setCurrentIndex(prev_idx)
+        self.tab_widget.setCurrentIndex((current - 1) % self.tab_widget.count())
 
     def switch_to_tab(self, index: int):
         if 0 <= index < self.tab_widget.count():
@@ -3922,25 +3102,23 @@ class NostalgiaBrowser(QMainWindow):
         tab = self.tab_widget.currentWidget()
         return tab.webview if isinstance(tab, BrowserTab) else None
 
-    def _set_zoom(self, factor: float):
-        wv = self.get_current_webview()
-        if wv:
-            factor = max(0.25, min(5.0, factor))
-            wv.setZoomFactor(factor)
-            self.zoom_label.setText(f"{int(factor*100)}%")
-
     def zoom_in(self):
         wv = self.get_current_webview()
         if wv:
-            self._set_zoom(wv.zoomFactor() + 0.1)
+            wv.setZoomFactor(min(wv.zoomFactor() + 0.1, 5.0))
+            self.zoom_label.setText(f"{int(wv.zoomFactor()*100)}%")
 
     def zoom_out(self):
         wv = self.get_current_webview()
         if wv:
-            self._set_zoom(wv.zoomFactor() - 0.1)
+            wv.setZoomFactor(max(wv.zoomFactor() - 0.1, 0.25))
+            self.zoom_label.setText(f"{int(wv.zoomFactor()*100)}%")
 
     def zoom_reset(self):
-        self._set_zoom(1.0)
+        wv = self.get_current_webview()
+        if wv:
+            wv.setZoomFactor(1.0)
+            self.zoom_label.setText("100%")
 
     def _toggle_popup_blocking(self, checked: bool):
         self.block_popups = checked
@@ -3949,14 +3127,14 @@ class NostalgiaBrowser(QMainWindow):
             if isinstance(tab, BrowserTab):
                 tab.nostalgia_page.block_popups = checked
         self.save_settings()
-        self.status_label.setText(f"Блокировка всплывающих окон {'включена' if checked else 'отключена'}")
+        self.status_label.setText(f"Блокировка окон {'вкл' if checked else 'выкл'}")
 
     def show_filter_settings(self):
         if FilterDialog(self.site_filter, self).exec():
             self.update_filter_indicator()
 
     def update_filter_indicator(self):
-        self.filter_status.setText("🔒 Фильтр вкл." if self.site_filter.filter_enabled else "")
+        self.filter_status.setText("🔒" if self.site_filter.filter_enabled else "")
 
     def show_homepage_settings(self):
         dlg = HomepageDialog(self.homepage, self)
@@ -3965,7 +3143,6 @@ class NostalgiaBrowser(QMainWindow):
             if new_hp and is_safe_url(QUrl(new_hp)):
                 self.homepage = new_hp
                 self.save_settings()
-                self.status_label.setText(f"Домашняя страница: {sanitize_display_text(new_hp, 50)}")
 
     def show_theme_dialog(self):
         dlg = ThemeDialog(self.current_theme, self)
@@ -3973,33 +3150,19 @@ class NostalgiaBrowser(QMainWindow):
             self.current_theme = dlg.selected_theme
             apply_theme(QApplication.instance(), self.current_theme)
             self.save_settings()
-            self.status_label.setText(f"Тема: {self.current_theme}")
 
     def show_search_engine_dialog(self):
         dlg = SearchEngineDialog(self.current_engine, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.current_engine = dlg.selected
             self.save_settings()
-            self.status_label.setText(f"Поисковая система: {self.current_engine}")
 
     def show_cookie_manager(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Управление cookie - Nostalgia")
-        dlg.resize(600, 400)
-        layout = QVBoxLayout(dlg)
-        label = QLabel("Управление cookie через настройки браузера.\nДля удаления всех cookie используйте «Очистить данные браузера» (Ctrl+Shift+Del).")
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        btn = QPushButton("Закрыть")
-        btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
-        dlg.exec()
+        QMessageBox.information(self, "Cookie", "Используйте Ctrl+Shift+Del для очистки")
 
     def show_password_manager(self):
         dlg = PasswordManagerDialog(self.password_manager, self)
         dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
 
     def show_bookmark_manager(self):
         dlg = BookmarkManagerDialog(self.bookmarks, self)
@@ -4024,42 +3187,14 @@ class NostalgiaBrowser(QMainWindow):
                 profile.cookieStore().deleteAllCookies()
                 cleared.append("cookie")
             except Exception as e:
-                SafeLogger.warning("Ошибка очистки cookie: %s", e)
+                SafeLogger.warning("Error clearing cookies: %s", e)
         
         if dlg.clear_cache:
             try:
                 profile.clearHttpCache()
                 cleared.append("кэш")
             except Exception as e:
-                SafeLogger.warning("Ошибка очистки кэша: %s", e)
-        
-        if dlg.clear_hsts:
-            try:
-                profile.clearHttpCache()
-                cleared.append("HSTS/SSL кэш")
-            except Exception as e:
-                SafeLogger.warning("Ошибка очистки HSTS: %s", e)
-        
-        if dlg.clear_storage:
-            try:
-                profile.clearHttpCache()
-                cleared.append("хранилища")
-            except Exception as e:
-                SafeLogger.warning("Ошибка очистки хранилищ: %s", e)
-        
-        if dlg.clear_http_auth:
-            try:
-                profile.clearHttpCache()
-                cleared.append("HTTP аутентификация")
-            except Exception as e:
-                SafeLogger.warning("Ошибка очистки HTTP auth: %s", e)
-        
-        if dlg.clear_webgl:
-            try:
-                profile.clearHttpCache()
-                cleared.append("WebGL шейдеры")
-            except Exception as e:
-                SafeLogger.warning("Ошибка очистки WebGL: %s", e)
+                SafeLogger.warning("Error clearing cache: %s", e)
         
         if dlg.clear_passwords:
             self.password_manager.clear_all()
@@ -4072,19 +3207,16 @@ class NostalgiaBrowser(QMainWindow):
         self.save_settings()
         msg = ", ".join(cleared) if cleared else "ничего"
         self.status_label.setText(f"Очищено: {msg}")
-        QMessageBox.information(self, "Очистка завершена", f"Успешно очищено: {msg}.")
+        QMessageBox.information(self, "Очистка", f"Очищено: {msg}.")
 
     def show_downloads(self):
         if self._download_manager is None:
             self._download_manager = DownloadManagerDialog(self)
         self._download_manager.show()
-        self._download_manager.raise_()
-        self._download_manager.activateWindow()
 
     def open_find_bar(self):
         tab = self.tab_widget.currentWidget()
         if isinstance(tab, BrowserTab):
-            tab.find_bar.set_webview(tab.webview)
             tab.find_bar.open_bar()
 
     def add_to_bookmarks(self):
@@ -4092,57 +3224,49 @@ class NostalgiaBrowser(QMainWindow):
         if wv:
             url = wv.url()
             if not is_safe_url(url):
-                self.status_label.setText("Нельзя добавить: небезопасная схема URL")
                 return
             url_str = url.toString()
             title = wv.title() or url_str
-            safe_title = sanitize_display_text(title, 100)
-            name, ok = QInputDialog.getText(self, "Добавление в избранное", "Название:", text=safe_title)
+            name, ok = QInputDialog.getText(self, "Добавить закладку", "Название:", text=sanitize_display_text(title, 100))
             if ok and name:
-                safe_name = html_escape(name[:200])
-                self.bookmarks[safe_name] = url_str
+                self.bookmarks[name] = url_str
                 self.save_settings()
-                self.status_label.setText("Добавлено в избранное")
+                self.status_label.setText("Закладка добавлена")
 
     def show_history(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("История - Nostalgia")
+        dlg.setWindowTitle("История")
         dlg.resize(600, 400)
         layout = QVBoxLayout(dlg)
         lw = QListWidget()
-        lw.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        
         for e in reversed(self.history[-200:]):
-            url_str = e.get('url', '')
-            if not url_str:
+            url = e.get('url', '')
+            if not url:
                 continue
             title = e.get('title', '')
-            safe_title = sanitize_display_text(title, 50) if title else ""
-            safe_url = sanitize_display_text(url_str, 80)
             time_str = ""
             if e.get('time'):
                 try:
                     dt = datetime.datetime.fromisoformat(e['time'])
                     time_str = f" [{dt.strftime('%d.%m.%Y %H:%M')}]"
-                except (ValueError, TypeError):
+                except:
                     pass
-            text = f"{safe_title}{time_str}  —  {safe_url}"
+            text = f"{sanitize_display_text(title, 50)}{time_str} — {sanitize_display_text(url, 80)}"
             item = QListWidgetItem()
             item.setText(text)
-            item.setData(Qt.ItemDataRole.UserRole, url_str)
+            item.setData(Qt.ItemDataRole.UserRole, url)
             lw.addItem(item)
         layout.addWidget(lw)
 
         def open_from_history(item):
-            url_str = item.data(Qt.ItemDataRole.UserRole)
-            if url_str:
-                q = QUrl(url_str)
+            url = item.data(Qt.ItemDataRole.UserRole)
+            if url:
+                q = QUrl(url)
                 if is_safe_url(q):
                     self.add_new_tab(q)
                 else:
-                    self.status_label.setText("Заблокировано: небезопасный URL из истории")
+                    self.status_label.setText("Небезопасный URL")
             dlg.accept()
-
         lw.itemDoubleClicked.connect(open_from_history)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(dlg.reject)
@@ -4153,11 +3277,9 @@ class NostalgiaBrowser(QMainWindow):
         text, ok = QInputDialog.getText(self, "Поиск", "Введите запрос:")
         if ok and text:
             safe_text = sanitize_search_query(text)
-            if not safe_text:
-                self.status_label.setText("Недопустимый поисковый запрос")
-                return
-            tmpl = SEARCH_ENGINES.get(self.current_engine, SEARCH_ENGINES["Google"])
-            self.load_url(tmpl.replace("{query}", quote_plus(safe_text)))
+            if safe_text:
+                tmpl = SEARCH_ENGINES.get(self.current_engine, SEARCH_ENGINES["Google"])
+                self.load_url(tmpl.replace("{query}", quote_plus(safe_text)))
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -4167,33 +3289,19 @@ class NostalgiaBrowser(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "О программе",
-            "Nostalgia Browser v0.8.2 (Поддержка камеры и WebRTC)\n\n"
-            "Вдохновлен Internet Explorer 5.5\n"
-            "Стиль: Windows 98 Classic\n\n"
-            "Особенности безопасности:\n"
-            "✓ Защита ключа шифрования\n"
-            "✓ Защита от DNS rebinding\n"
-            "✓ Заголовки безопасности\n"
-            "✓ Защита от XSS и инъекций\n"
-            "✓ Безопасное хранение паролей\n"
-            "✓ Поддержка WebRTC и WebSocket\n"
-            "✓ Совместимость с VideoPlayTool\n\n"
-            "© 2026 Nostalgia Project"
-        )
+            "Nostalgia Browser v0.8.5\n\n"
+            "Безопасный браузер в стиле Windows 98\n"
+            "© 2026 Nostalgia Project")
 
     def closeEvent(self, event):
         if self.tab_widget.count() > 1:
-            reply = QMessageBox.question(
-                self, "Подтверждение выхода", 
-                f"Закрыть {self.tab_widget.count()} вкладок и выйти?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
+            reply = QMessageBox.question(self, "Выход", f"Закрыть {self.tab_widget.count()} вкладок?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
         
         self._flush_history_queue()
-        
         self._cleanup_security()
         self.save_settings()
         self.site_filter.save_lists()
@@ -4213,9 +3321,7 @@ class NostalgiaBrowser(QMainWindow):
 
 
 def main():
-    QWebEngineUrlScheme.registerScheme(
-        QWebEngineUrlScheme(b"nostalgia")
-    )
+    QWebEngineUrlScheme.registerScheme(QWebEngineUrlScheme(b"nostalgia"))
     
     app = QApplication(sys.argv)
     app.setApplicationName("Nostalgia Browser")

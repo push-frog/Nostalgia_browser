@@ -221,3 +221,7 @@ __marimo__/
 **/nostalgia_settings.json
 **/planet.gif
 **/nostalgia_settings.json.backup
+**/nostalgia_key.key
+**/nostalgia_passwords.dat
+**/nostalgia.log
+**/nostalgia_filter.json
