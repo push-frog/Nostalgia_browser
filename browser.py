@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Nostalgia Browser - Безопасный браузер в стиле Windows 98
-Версия: 0.8.5 (Полностью рабочий, без CSP блокировок)
+Версия: 0.8.6 (Полностью рабочий, с мастер-паролем, без CSP блокировок)
 """
 
 import sys
@@ -1530,6 +1530,10 @@ class SearchEngineDialog(QDialog):
         self.accept()
 
 
+# ──────────────────────────────────────────────
+# БЕЗОПАСНЫЙ МЕНЕДЖЕР ПАРОЛЕЙ С МАСТЕР-ПАРОЛЕМ
+# ──────────────────────────────────────────────
+
 class SecurePasswordManager:
     def __init__(self, parent_widget=None):
         self._entries: list[dict] = []
@@ -1549,7 +1553,11 @@ class SecurePasswordManager:
         self._key_file = os.path.join(self._key_dir, "nostalgia_key.key")
         self._passwords_file = os.path.join(self._key_dir, "nostalgia_passwords.dat")
         self._load()
-
+        
+        # Если нет мастер-пароля, запрашиваем его создание
+        if not self._master_password_hash:
+            self._setup_master_password()
+    
     def _get_secure_key_dir(self) -> str:
         if sys.platform == 'win32':
             base_dir = os.environ.get('APPDATA', '')
@@ -1560,28 +1568,289 @@ class SecurePasswordManager:
         key_dir = os.path.join(base_dir, 'NostalgiaBrowser', 'secure')
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
         return key_dir
-
+    
+    def _setup_master_password(self):
+        """Установка мастер-пароля при первом запуске"""
+        dlg = QDialog(self._parent_widget)
+        dlg.setWindowTitle("Установка мастер-пароля - Nostalgia Browser")
+        dlg.setFixedSize(400, 280)
+        dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 12)
+        
+        icon_label = QLabel()
+        icon_label.setFixedSize(48, 48)
+        px = QPixmap(48, 48)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(0, 80, 180)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(0, 0, 48, 48)
+        p.setPen(QPen(QColor(Qt.GlobalColor.white), 3))
+        p.setFont(QFont("Tahoma", 20, QFont.Weight.Bold))
+        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "🔑")
+        p.end()
+        icon_label.setPixmap(px)
+        
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(icon_label)
+        
+        msg = QLabel("<b>Установите мастер-пароль</b><br><br>Этот пароль будет использоваться для защиты всех сохранённых паролей.<br><br><b>ВНИМАНИЕ:</b> При потере пароля доступ к паролям будет невозможен!")
+        msg.setWordWrap(True)
+        top_layout.addWidget(msg, 1)
+        layout.addLayout(top_layout)
+        
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+        
+        form = QFormLayout()
+        pwd_edit = QLineEdit()
+        pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pwd_edit.setPlaceholderText("Введите мастер-пароль")
+        form.addRow("Пароль:", pwd_edit)
+        
+        pwd_confirm = QLineEdit()
+        pwd_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+        pwd_confirm.setPlaceholderText("Подтвердите пароль")
+        form.addRow("Подтверждение:", pwd_confirm)
+        
+        layout.addLayout(form)
+        
+        show_cb = QCheckBox("Показать пароль")
+        def toggle_visibility(visible):
+            mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+            pwd_edit.setEchoMode(mode)
+            pwd_confirm.setEchoMode(mode)
+        show_cb.toggled.connect(toggle_visibility)
+        layout.addWidget(show_cb)
+        
+        hint = QLabel(f"Минимальная длина: {MIN_PASSWORD_LENGTH} символов")
+        hint.setStyleSheet("color: gray; font-size: 8pt;")
+        layout.addWidget(hint)
+        
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        
+        password = None
+        def validate():
+            nonlocal password
+            pwd = pwd_edit.text()
+            pwd2 = pwd_confirm.text()
+            if len(pwd) < MIN_PASSWORD_LENGTH:
+                QMessageBox.warning(dlg, "Ошибка", f"Пароль должен содержать минимум {MIN_PASSWORD_LENGTH} символов.")
+                return
+            if pwd != pwd2:
+                QMessageBox.warning(dlg, "Ошибка", "Пароли не совпадают.")
+                return
+            password = pwd
+            dlg.accept()
+        
+        bb.accepted.connect(validate)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+        
+        if dlg.exec() == QDialog.DialogCode.Accepted and password:
+            self.set_master_password(password)
+            secure_zero_memory(password)
+            self._is_unlocked = True
+            self._last_unlock_time = MonotonicTime.now()
+    
+    def unlock(self) -> bool:
+        """Запрос мастер-пароля для разблокировки"""
+        if self._is_unlocked:
+            if MonotonicTime.now() - self._last_unlock_time > PASSWORD_MANAGER_UNLOCK_TIMEOUT:
+                self.lock()
+            else:
+                return True
+        
+        dlg = QDialog(self._parent_widget)
+        dlg.setWindowTitle("Ввод мастер-пароля - Nostalgia Browser")
+        dlg.setFixedSize(400, 220)
+        dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint)
+        
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 12)
+        
+        icon_label = QLabel()
+        icon_label.setFixedSize(48, 48)
+        px = QPixmap(48, 48)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(0, 80, 180)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(0, 0, 48, 48)
+        p.setPen(QPen(QColor(Qt.GlobalColor.white), 3))
+        p.setFont(QFont("Tahoma", 20, QFont.Weight.Bold))
+        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "🔑")
+        p.end()
+        icon_label.setPixmap(px)
+        
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(icon_label)
+        
+        msg = QLabel("<b>Введите мастер-пароль</b><br><br>Для доступа к сохранённым паролям необходим мастер-пароль.")
+        msg.setWordWrap(True)
+        top_layout.addWidget(msg, 1)
+        layout.addLayout(top_layout)
+        
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+        
+        form = QFormLayout()
+        pwd_edit = QLineEdit()
+        pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pwd_edit.setPlaceholderText("Введите мастер-пароль")
+        form.addRow("Пароль:", pwd_edit)
+        layout.addLayout(form)
+        
+        show_cb = QCheckBox("Показать пароль")
+        show_cb.toggled.connect(lambda c: pwd_edit.setEchoMode(QLineEdit.EchoMode.Normal if c else QLineEdit.EchoMode.Password))
+        layout.addWidget(show_cb)
+        
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        
+        password = None
+        def validate():
+            nonlocal password
+            pwd = pwd_edit.text()
+            if not pwd:
+                QMessageBox.warning(dlg, "Ошибка", "Введите мастер-пароль.")
+                return
+            password = pwd
+            dlg.accept()
+        
+        bb.accepted.connect(validate)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+        
+        if dlg.exec() == QDialog.DialogCode.Accepted and password:
+            if self.verify_master_password(password):
+                secure_zero_memory(password)
+                self._is_unlocked = True
+                self._last_unlock_time = MonotonicTime.now()
+                return True
+        
+        return False
+    
+    def lock(self):
+        """Блокировка менеджера паролей"""
+        self._is_unlocked = False
+        self.clear_secure_items()
+        self._access_times.clear()
+        self._failed_attempts.clear()
+        self._lockout_until.clear()
+    
     def _get_cipher(self) -> Optional[Fernet]:
+        if not self._master_password_hash:
+            return None
         if self._cipher is None and os.path.exists(self._key_file):
             try:
                 with open(self._key_file, 'rb') as f:
                     key = f.read()
                 self._cipher = Fernet(key)
             except Exception:
-                pass
+                self._cipher = None
         return self._cipher
-
+    
+    def set_master_password(self, password: str):
+        """Устанавливает мастер-пароль с PBKDF2"""
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(f"Master password must be at least {MIN_PASSWORD_LENGTH} characters")
+        
+        self._salt = secrets.token_bytes(32)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self._salt,
+            iterations=PBKDF2_ITERATIONS,
+            backend=default_backend()
+        )
+        key = base64.b64encode(kdf.derive(password.encode()))
+        
+        self._master_password_hash = base64.b64encode(self._salt + key).decode()
+        
+        fernet_key = Fernet.generate_key()
+        with open(self._key_file, 'wb') as f:
+            f.write(fernet_key)
+        os.chmod(self._key_file, KEY_FILE_PERMISSIONS)
+        self._cipher = Fernet(fernet_key)
+        
+        self._reencrypt_passwords()
+        self._save()
+    
+    def verify_master_password(self, password: str) -> bool:
+        """Проверка мастер-пароля с защитой от брутфорса"""
+        if self._master_lockout_until:
+            if MonotonicTime.now() < self._master_lockout_until:
+                SafeLogger.warning("Master password verification blocked")
+                return False
+            else:
+                self._master_lockout_until = None
+                self._failed_master_attempts = 0
+        
+        if not self._master_password_hash:
+            return True
+        
+        try:
+            decoded = base64.b64decode(self._master_password_hash)
+            salt = decoded[:32]
+            stored_key = decoded[32:]
+            
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=PBKDF2_ITERATIONS,
+                backend=default_backend()
+            )
+            key = base64.b64encode(kdf.derive(password.encode()))
+            
+            is_valid = secure_compare(key.decode(), stored_key.decode())
+            
+            if not is_valid:
+                self._failed_master_attempts += 1
+                if self._failed_master_attempts >= MAX_MASTER_PASSWORD_ATTEMPTS:
+                    self._master_lockout_until = MonotonicTime.now() + MASTER_PASSWORD_LOCKOUT_SECONDS
+                    SafeLogger.warning("Master password locked due to too many attempts")
+                return False
+            
+            self._failed_master_attempts = 0
+            return True
+        except Exception as e:
+            SafeLogger.warning("Error verifying master password: %s", e)
+            return False
+    
+    def _reencrypt_passwords(self):
+        cipher = self._get_cipher()
+        if not cipher:
+            return
+        try:
+            for entry in self._entries:
+                if 'password' in entry:
+                    old_password = self._decrypt(entry['password'])
+                    entry['password'] = self._encrypt(old_password)
+                    secure_zero_memory(old_password)
+            self._save()
+        except Exception as e:
+            SafeLogger.warning("Error reencrypting passwords: %s", e)
+    
     def _encrypt(self, data: str) -> str:
         cipher = self._get_cipher()
         return cipher.encrypt(data.encode()).decode() if cipher else ""
-
+    
     def _decrypt(self, encrypted: str) -> str:
         cipher = self._get_cipher()
         try:
             return cipher.decrypt(encrypted.encode()).decode() if cipher else ""
         except Exception:
             return ""
-
+    
     def _load(self):
         try:
             if os.path.exists(self._passwords_file):
@@ -1592,7 +1861,8 @@ class SecurePasswordManager:
                     self._entries = json.loads(decrypted)
         except Exception as e:
             SafeLogger.warning("Ошибка загрузки паролей: %s", e)
-
+            self._entries = []
+    
     def _save(self):
         cipher = self._get_cipher()
         if not cipher:
@@ -1605,11 +1875,17 @@ class SecurePasswordManager:
             os.chmod(self._passwords_file, KEY_FILE_PERMISSIONS)
         except Exception as e:
             SafeLogger.warning("Ошибка сохранения паролей: %s", e)
-
+    
     def entries(self) -> list[dict]:
+        if not self._is_unlocked:
+            if not self.unlock():
+                return []
         return list(self._entries)
-
+    
     def add(self, url: str, login: str, password: str):
+        if not self._is_unlocked:
+            if not self.unlock():
+                return
         for e in self._entries:
             if e['url'] == url and e['login'] == login:
                 e['password'] = self._encrypt(password)
@@ -1617,32 +1893,95 @@ class SecurePasswordManager:
                 return
         self._entries.append({'url': url, 'login': login, 'password': self._encrypt(password)})
         self._save()
-
+    
     def remove(self, index: int):
+        if not self._is_unlocked:
+            if not self.unlock():
+                return
         if 0 <= index < len(self._entries):
+            if 'password' in self._entries[index]:
+                secure_zero_memory(self._decrypt(self._entries[index]['password']))
             del self._entries[index]
             self._save()
-
-    def show_password_secure(self, index: int, widget: QTableWidgetItem) -> bool:
+    
+    def get_password(self, index: int) -> str:
+        if not self._is_unlocked:
+            return ''
         if 0 <= index < len(self._entries):
-            password = self._decrypt(self._entries[index]['password'])
-            if password:
-                item = self._secure_items.get(index)
-                if not item:
-                    item = SecurePasswordItem()
-                    self._secure_items[index] = item
-                item.show_password(widget, password)
-                return True
-        return False
-
+            return self._decrypt(self._entries[index]['password'])
+        return ''
+    
+    def get_password_secure(self, index: int) -> Optional[str]:
+        if not self._is_unlocked:
+            return None
+        now = MonotonicTime.now()
+        if str(index) in self._lockout_until:
+            if now < self._lockout_until[str(index)]:
+                SafeLogger.warning("Password access blocked for index %d", index)
+                return None
+            else:
+                del self._lockout_until[str(index)]
+                self._failed_attempts.pop(str(index), None)
+        last_access = self._access_times.get(index)
+        if last_access and (now - last_access) < 1:
+            self._failed_attempts[str(index)] = self._failed_attempts.get(str(index), 0) + 1
+            if self._failed_attempts[str(index)] > 5:
+                self._lockout_until[str(index)] = now + 300
+                SafeLogger.warning("Password access locked for index %d due to too many attempts", index)
+                return None
+            return None
+        self._failed_attempts.pop(str(index), None)
+        self._access_times[index] = now
+        return self.get_password(index)
+    
+    def show_password_secure(self, index: int, widget: QTableWidgetItem) -> bool:
+        if not self._is_unlocked:
+            if not self.unlock():
+                return False
+        password = self.get_password_secure(index)
+        if password is None:
+            return False
+        item = self._secure_items.get(index)
+        if not item:
+            item = SecurePasswordItem()
+            self._secure_items[index] = item
+        item.show_password(widget, password)
+        return True
+    
     def clear_secure_items(self):
         for item in self._secure_items.values():
             item.hide_password()
         self._secure_items.clear()
-
+    
+    def find_for_url(self, url: str) -> list[dict]:
+        if not self._is_unlocked:
+            return []
+        try:
+            domain = urlparse(url).netloc.lower()
+        except Exception:
+            return []
+        result = []
+        for i, e in enumerate(self._entries):
+            try:
+                edomain = urlparse(e['url']).netloc.lower()
+            except Exception:
+                continue
+            if edomain == domain:
+                result.append({'index': i, **e})
+        return result
+    
     def clear_all(self):
+        if not self._is_unlocked:
+            if not self.unlock():
+                return
         self.clear_secure_items()
+        for entry in self._entries:
+            if 'password' in entry:
+                secure_zero_memory(self._decrypt(entry['password']))
         self._entries = []
+        self._access_times.clear()
+        self._failed_attempts.clear()
+        self._lockout_until.clear()
         self._save()
 
 
@@ -1652,49 +1991,81 @@ class PasswordManagerDialog(QDialog):
         self.pm = password_manager
         self.setWindowTitle("Управление паролями - Nostalgia")
         self.resize(680, 440)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint | Qt.WindowType.WindowMinimizeButtonHint)
         if parent:
             geo = parent.geometry()
             self.move(geo.center().x()-340, geo.center().y()-220)
         self._build_ui()
+        
+        # Проверяем разблокировку
+        if not self.pm._is_unlocked:
+            if not self.pm.unlock():
+                QMessageBox.warning(self, "Доступ запрещён", "Не удалось разблокировать менеджер паролей.")
+                self.close()
+                return
+        
         self._refresh()
-
+    
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-        warn = QLabel("🔒 Пароли хранятся в зашифрованном виде.")
-        warn.setStyleSheet("color: #008000; font-size: 8pt;")
+        layout.setSpacing(6)
+        
+        warn = QLabel("🔒 Пароли хранятся в зашифрованном виде. Для доступа требуется мастер-пароль.")
+        warn.setStyleSheet("color: #008000; font-size: 8pt; font-weight: bold;")
+        warn.setWordWrap(True)
         layout.addWidget(warn)
+        
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Сайт", "Логин", "Пароль", ""])
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(3, 30)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table)
+        
         bottom = QHBoxLayout()
         self.count_lbl = QLabel("Записей: 0")
         bottom.addWidget(self.count_lbl)
         bottom.addStretch()
+        
+        lock_btn = QPushButton("🔒 Заблокировать")
+        lock_btn.clicked.connect(self._lock_manager)
+        bottom.addWidget(lock_btn)
+        
         add_btn = QPushButton("Добавить")
         add_btn.clicked.connect(self._add_entry)
         bottom.addWidget(add_btn)
+        
         del_btn = QPushButton("Удалить")
         del_btn.clicked.connect(self._delete_selected)
         bottom.addWidget(del_btn)
+        
         del_all_btn = QPushButton("Удалить все")
         del_all_btn.clicked.connect(self._delete_all)
         bottom.addWidget(del_all_btn)
+        
         close_btn = QPushButton("Закрыть")
         close_btn.clicked.connect(self.close)
         bottom.addWidget(close_btn)
+        
         layout.addLayout(bottom)
-
+    
+    def _lock_manager(self):
+        self.pm.lock()
+        self.table.setRowCount(0)
+        self.count_lbl.setText("Записей: 0 (заблокировано)")
+        QMessageBox.information(self, "Блокировка", "Менеджер паролей заблокирован. Для доступа потребуется мастер-пароль.")
+    
     def _refresh(self):
         self.table.setRowCount(0)
-        for i, e in enumerate(self.pm.entries()):
+        entries = self.pm.entries()
+        for i, e in enumerate(entries):
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(sanitize_display_text(e['url'], 50)))
@@ -1704,14 +2075,15 @@ class PasswordManagerDialog(QDialog):
             self.table.setItem(row, 2, pwd_item)
             show_btn = QPushButton("👁")
             show_btn.setFixedSize(26, 22)
+            show_btn.setToolTip("Показать пароль (автоскрытие через 10 сек)")
             show_btn.clicked.connect((lambda idx, item=pwd_item: lambda: self._show_password_secure(idx, item))(i))
             self.table.setCellWidget(row, 3, show_btn)
         self.count_lbl.setText(f"Записей: {self.table.rowCount()}")
-
+    
     def _show_password_secure(self, entry_index: int, widget: QTableWidgetItem):
         if not self.pm.show_password_secure(entry_index, widget):
-            QMessageBox.warning(self, "Ошибка", "Не удалось показать пароль.")
-
+            QMessageBox.warning(self, "Защита пароля", "Слишком много попыток показа пароля. Попробуйте позже.")
+    
     def _add_entry(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Добавить пароль")
@@ -1748,8 +2120,9 @@ class PasswordManagerDialog(QDialog):
         layout.addWidget(bb)
         if dlg.exec() == QDialog.DialogCode.Accepted and result[0]:
             self.pm.add(result[0], result[1], result[2])
+            secure_zero_memory(result[2])
             self._refresh()
-
+    
     def _delete_selected(self):
         rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()), reverse=True)
         for row in rows:
@@ -1757,13 +2130,13 @@ class PasswordManagerDialog(QDialog):
             if item:
                 self.pm.remove(item.data(Qt.ItemDataRole.UserRole))
         self._refresh()
-
+    
     def _delete_all(self):
-        reply = QMessageBox.question(self, "Удалить все пароли", "Удалить все сохранённые пароли?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(self, "Удалить все пароли", "Удалить все сохранённые пароли? Это действие необратимо.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.pm.clear_all()
             self._refresh()
-
+    
     def closeEvent(self, event):
         self.pm.clear_secure_items()
         super().closeEvent(event)
@@ -3289,8 +3662,12 @@ class NostalgiaBrowser(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(self, "О программе",
-            "Nostalgia Browser v0.8.5\n\n"
+            "Nostalgia Browser v0.8.6\n\n"
             "Безопасный браузер в стиле Windows 98\n"
+            "✓ Мастер-пароль для защиты паролей\n"
+            "✓ Защита от DNS rebinding\n"
+            "✓ Поддержка локальных сетей\n"
+            "✓ Шифрование паролей AES-128\n"
             "© 2026 Nostalgia Project")
 
     def closeEvent(self, event):
